@@ -9,32 +9,30 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 HANDLE = "@로투파"
 
-# 4:5 세로형 (인스타그램 캐러셀 권장 비율)
-W, H = 1080, 1350
+W, H = 1080, 1350  # 4:5 세로형
 SAFE_PAD = 90
 FOOTER_H = 100
 
-# 스타일1 (본문 카드): 흰 배경 + 검은 제목 + 초록 불릿
 BG_WHITE = (255, 255, 255)
 TITLE_BLACK = (20, 22, 26)
 BULLET_GREEN = (46, 196, 106)
 BODY_BLACK = (35, 38, 44)
 FOOTER_GRAY = (150, 154, 162)
 
-# 스타일2 (표지): 사진 + 오버레이
-ACCENT_BLUE = (66, 133, 255)
 WHITE = (245, 246, 248)
-BRAND_GREEN = (57, 255, 20)  # 로고와 동일한 네온 그린 (표지 제목 색상)
+BRAND_GREEN = (57, 255, 20)  # 표지 제목 색상 (로고와 동일)
 
 FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 
 # 챗별로 "표지용 사진을 기다리는 중" 상태를 잠깐 기억해두는 메모리 저장소
-# (서버가 재시작되면 초기화되니, 사진 보낸 뒤 너무 오래 기다리면 다시 보내야 해요)
 PENDING_PHOTOS = {}
 
 
@@ -45,8 +43,6 @@ def font(path, size):
 F_TITLE = "IBMPlexSansKR-Bold.ttf"
 F_BODY = "IBMPlexSansKR-Regular.ttf"
 F_MONO = "IBMPlexMono-Medium.ttf"
-
-NUM_RE = re.compile(r"[0-9][0-9,\.]*%?")
 
 
 def wrap_text(draw, text, fnt, max_width):
@@ -65,32 +61,67 @@ def wrap_text(draw, text, fnt, max_width):
     return lines
 
 
-def draw_mixed_line(draw, xy, text, fnt, base_color, accent_color):
-    """숫자/퍼센트 구간만 강조색으로 칠해서 한 줄 출력, 다음 줄 시작 y 좌표는 호출부에서 관리"""
-    x, y = xy
-    pos = 0
-    for m in NUM_RE.finditer(text):
-        if m.start() > pos:
-            seg = text[pos:m.start()]
-            draw.text((x, y), seg, font=fnt, fill=base_color)
-            x += draw.textlength(seg, font=fnt)
-        seg = m.group()
-        draw.text((x, y), seg, font=fnt, fill=accent_color)
-        x += draw.textlength(seg, font=fnt)
-        pos = m.end()
-    if pos < len(text):
-        seg = text[pos:]
-        draw.text((x, y), seg, font=fnt, fill=base_color)
+# ============ AI로 원문 → 카드 구조 변환 ============
+def ai_structure_content(raw_text):
+    prompt = f"""다음 뉴스 원문을 인스타그램 카드뉴스로 재구성해줘.
+아래 JSON 형식으로만 답해. 다른 설명이나 문장은 절대 붙이지 마.
+
+{{
+  "thumbnail_title": "표지에 들어갈 임팩트있는 헤드라인 (18자 내외, 핵심 키워드/숫자 포함)",
+  "search_query": "표지 배경 스톡사진 검색용 영어 키워드 2~4단어 (예: japan yen currency)",
+  "cards": [
+    {{"title": "카드 제목 (짧고 명확하게)", "bullets": ["핵심 포인트 한 문장", "핵심 포인트 한 문장"]}}
+  ]
+}}
+
+- cards는 원문 분량에 따라 2~10장 사이로 알아서 나눠줘 (내용이 적으면 2장, 아주 많으면 10장까지)
+- 각 카드의 bullets는 2~3개, 각각 간결한 한 문장으로
+- 원문: 
+{raw_text}
+"""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 2500,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    text = resp.json()["content"][0]["text"].strip()
+    # 혹시 ```json 코드블록으로 감싸서 오면 제거
+    text = re.sub(r"^```json\s*|\s*```$", "", text.strip())
+    return json.loads(text)
 
 
-# ============ 스타일 2: 표지 (사진 + 텍스트 오버레이) ============
+def search_pexels_photo(query):
+    r = requests.get(
+        "https://api.pexels.com/v1/search",
+        headers={"Authorization": PEXELS_API_KEY},
+        params={"query": query, "per_page": 5, "orientation": "portrait"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    photos = r.json().get("photos", [])
+    if not photos:
+        raise Exception("사진을 찾지 못했어요")
+    img_url = photos[0]["src"]["large2x"]
+    return requests.get(img_url, timeout=20).content
+
+
+# ============ 표지 (사진 + 텍스트 오버레이) ============
 def make_cover(photo_bytes, title, page_label):
     photo = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
     photo = ImageOps.fit(photo, (W, H), method=Image.LANCZOS)
     img = photo.copy()
     draw = ImageDraw.Draw(img, "RGBA")
 
-    # 하단부를 어둡게 그라데이션 처리해서 글자가 잘 보이게
     grad_h = int(H * 0.55)
     for i in range(grad_h):
         alpha = int(210 * (i / grad_h))
@@ -109,7 +140,7 @@ def make_cover(photo_bytes, title, page_label):
 
     y = handle_y + 46
     for line in title_lines:
-        draw_mixed_line(draw, (SAFE_PAD, y), line, font(F_TITLE, title_size), BRAND_GREEN, BRAND_GREEN)
+        draw.text((SAFE_PAD, y), line, font=font(F_TITLE, title_size), fill=BRAND_GREEN)
         y += int(title_size * 1.3)
 
     w = draw.textlength(page_label, font=font(F_MONO, 22))
@@ -118,7 +149,7 @@ def make_cover(photo_bytes, title, page_label):
     return img.convert("RGB")
 
 
-# ============ 스타일 1: 본문 카드 (흰 배경 + 검은 제목 + 초록 불릿) ============
+# ============ 본문 카드 (흰 배경 + 검은 제목 + 초록 불릿) ============
 def make_content_card(title, bullets, page_label):
     img = Image.new("RGB", (W, H), BG_WHITE)
     draw = ImageDraw.Draw(img)
@@ -154,7 +185,7 @@ def make_content_card(title, bullets, page_label):
     for wrapped in bullet_lines_per_item:
         dot_y = y + bullet_size // 2 - 6
         draw.ellipse([SAFE_PAD, dot_y, SAFE_PAD + 12, dot_y + 12], fill=BULLET_GREEN)
-        for j, line in enumerate(wrapped):
+        for line in wrapped:
             draw.text((SAFE_PAD + 34, y), line, font=font(F_BODY, bullet_size), fill=BODY_BLACK)
             y += int(bullet_size * 1.5)
         y += 24
@@ -165,20 +196,6 @@ def make_content_card(title, bullets, page_label):
     draw.text((W - SAFE_PAD - w, H - FOOTER_H + 26), page_label, font=font(F_MONO, 22), fill=FOOTER_GRAY)
 
     return img
-
-
-def parse_content_blocks(text):
-    """빈 줄로 구분된 묶음 하나 = 카드 한 장. 첫 줄=제목, 나머지 줄=불릿 각각 한 줄씩."""
-    blocks = [b.strip() for b in text.strip().split("\n\n") if b.strip()]
-    cards = []
-    for block in blocks:
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-        if not lines:
-            continue
-        title = lines[0]
-        bullets = lines[1:]
-        cards.append((title, bullets))
-    return cards
 
 
 def send_photo_group(chat_id, images):
@@ -223,49 +240,39 @@ def webhook():
 
     if text.startswith("/start"):
         send_message(chat_id, (
-            "카드뉴스를 만들어드릴게요.\n\n"
-            "① 먼저 표지에 쓸 사진을 캡션과 함께 보내주세요.\n"
-            "   캡션 예시: 반도체가 다시 흔들리기 시작했다\n\n"
-            "② 그다음 나머지 카드 내용을 텍스트로 보내주세요.\n"
-            "   빈 줄로 구분하면 그 묶음이 카드 한 장이 되고,\n"
-            "   첫 줄은 제목, 나머지 줄은 불릿포인트가 돼요.\n\n"
-            "예시:\n"
-            "거래량 먼저 확인하세요\n"
-            "평소 대비 3배 이상 터졌는지 확인\n"
-            "장중 저점 대비 반등했는지도 체크\n\n"
-            "지수 대비 낙폭도 비교하세요\n"
-            "개별 종목이 SOXX보다 더 빠졌는지 확인"
+            "뉴스 원문을 그대로 붙여넣어 보내주세요.\n"
+            "제가 알아서 표지 제목을 만들고, 어울리는 사진을 찾고,\n"
+            "나머지 내용을 카드 여러 장으로 정리해드릴게요.\n\n"
+            "직접 고른 사진을 표지로 쓰고 싶으면,\n"
+            "그 사진을 먼저 보내주시고 그다음 원문을 보내주세요."
         ))
         return "ok"
 
     try:
         if photos:
-            # 가장 큰 해상도 사진 선택 → 표지용으로 임시 저장
             file_id = photos[-1]["file_id"]
             photo_bytes = download_telegram_file(file_id)
-            title = text.strip() if text.strip() else "제목을 입력해주세요"
-            PENDING_PHOTOS[chat_id] = {"photo": photo_bytes, "title": title}
-            send_message(chat_id, "표지 사진 받았어요! 이제 나머지 카드 내용을 이어서 보내주세요.")
+            PENDING_PHOTOS[chat_id] = photo_bytes
+            send_message(chat_id, "사진 받았어요! 이제 원문을 이어서 보내주세요.")
             return "ok"
 
         if not text.strip():
             return "ok"
 
-        cards = parse_content_blocks(text)
-        if not cards:
-            send_message(chat_id, "내용을 인식하지 못했어요. /start 를 눌러서 형식을 확인해주세요.")
-            return "ok"
+        send_message(chat_id, "카드뉴스 만드는 중이에요, 잠시만 기다려주세요...")
 
-        pending = PENDING_PHOTOS.pop(chat_id, None)
-        total = len(cards) + (1 if pending else 0)
-        images = []
-        page = 1
-        if pending:
-            images.append(make_cover(pending["photo"], pending["title"], f"{page} / {total}"))
-            page += 1
-        for title, bullets in cards:
-            images.append(make_content_card(title, bullets, f"{page} / {total}"))
-            page += 1
+        structured = ai_structure_content(text)
+        thumbnail_title = structured["thumbnail_title"]
+        search_query = structured.get("search_query", "business finance")
+        cards = structured["cards"]
+
+        manual_photo = PENDING_PHOTOS.pop(chat_id, None)
+        cover_photo = manual_photo if manual_photo else search_pexels_photo(search_query)
+
+        total = 1 + len(cards)
+        images = [make_cover(cover_photo, thumbnail_title, f"1 / {total}")]
+        for i, c in enumerate(cards, 2):
+            images.append(make_content_card(c["title"], c["bullets"], f"{i} / {total}"))
 
         send_photo_group(chat_id, images)
     except Exception as e:
