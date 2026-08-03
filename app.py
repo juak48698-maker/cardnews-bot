@@ -2,6 +2,10 @@ import os
 import io
 import re
 import json
+import time
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from flask import Flask, request
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -26,6 +30,9 @@ BRAND_GREEN = (57, 255, 20)  # 강조 색상
 FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 
 PENDING_PHOTOS = {}
+ACTIVE_JOBS = {}  # chat_id -> {"cancelled": bool}
+PROCESSED_UPDATE_IDS = deque(maxlen=2000)  # 텔레그램 재전송(같은 update_id) 중복 처리 방지
+PHOTO_LOCK = threading.Lock()  # used_photo_ids 동시접근 보호 (병렬 사진검색용)
 
 
 def font(path, size):
@@ -187,7 +194,7 @@ def ai_structure_content(raw_text):
   ]
 }}
 
-- cards는 원문 분량에 따라 2~10장 사이로 알아서 나눠줘
+- cards는 원문 분량에 따라 2~9장 사이로 알아서 나눠줘 (표지 1장을 더하면 인스타그램 캐러셀 최대 장수인 10장을 넘지 않아야 해)
 - body는 불릿 없이 자연스럽게 이어지는 문단으로, 강조 구절은 딱 하나만 **로 감싸기
 - 중요: thumbnail_line1, thumbnail_line2, title, body 안에는 이모지를 절대 넣지 마. 이모지는 각 카드의 emoji 필드에만 딱 1개씩 넣어줘
 - 원문:
@@ -202,7 +209,7 @@ def ai_structure_content(raw_text):
         },
         json={
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 3000,
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=60,
@@ -213,29 +220,36 @@ def ai_structure_content(raw_text):
     return json.loads(text)
 
 
-def search_pexels_photo(query, used_ids=None):
+def search_pexels_photo(query, used_ids=None, lock=None):
     r = requests.get(
         "https://api.pexels.com/v1/search",
         headers={"Authorization": PEXELS_API_KEY},
         params={"query": query, "per_page": 10, "orientation": "portrait"},
-        timeout=20,
+        timeout=12,
     )
     r.raise_for_status()
     photos = r.json().get("photos", [])
     if not photos:
         raise Exception(f"'{query}' 사진을 찾지 못했어요")
 
-    chosen = None
-    if used_ids is not None:
-        for p in photos:
-            if p["id"] not in used_ids:
-                chosen = p
-                break
-    if chosen is None:
-        chosen = photos[0]  # 전부 이미 썼으면(검색결과 부족) 어쩔 수 없이 첫번째라도 사용
+    def pick():
+        chosen = None
+        if used_ids is not None:
+            for p in photos:
+                if p["id"] not in used_ids:
+                    chosen = p
+                    break
+        if chosen is None:
+            chosen = photos[0]
+        if used_ids is not None:
+            used_ids.add(chosen["id"])
+        return chosen
 
-    if used_ids is not None:
-        used_ids.add(chosen["id"])
+    if lock is not None:
+        with lock:
+            chosen = pick()
+    else:
+        chosen = pick()
 
     return requests.get(chosen["src"]["large2x"], timeout=20).content
 
@@ -370,9 +384,70 @@ def download_telegram_file(file_id):
     return requests.get(f"{TELEGRAM_FILE_API}/{file_path}", timeout=20).content
 
 
+def process_generation(chat_id, text):
+    job = {"cancelled": False}
+    ACTIVE_JOBS[chat_id] = job
+    try:
+        send_message(chat_id, "카드뉴스 만드는 중이에요, 잠시만 기다려주세요... (중단하려면 '취소'라고 보내주세요)")
+
+        s = ai_structure_content(text)
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+
+        cover_query = s.get("search_query", "business finance")
+        cards = s["cards"][:9]  # 표지 1장 + 본문 최대 9장 = 인스타그램 캐러셀 최대치(10장) 안전장치
+        manual_photo = PENDING_PHOTOS.pop(chat_id, None)
+        used_photo_ids = set()
+
+        cover_photo = manual_photo if manual_photo else search_pexels_photo(cover_query, used_photo_ids, PHOTO_LOCK)
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+
+        total = 1 + len(cards)
+
+        def fetch_one(c):
+            q = c.get("search_query", cover_query)
+            try:
+                return search_pexels_photo(q, used_photo_ids, PHOTO_LOCK)
+            except Exception:
+                return search_pexels_photo(cover_query, used_photo_ids, PHOTO_LOCK)
+
+        # 카드별 사진을 순서대로가 아니라 한꺼번에(동시에) 가져와서 속도를 크게 단축
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            photo_results = list(pool.map(fetch_one, cards))
+
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+
+        images = [make_cover(cover_photo, s["thumbnail_line1"], s["thumbnail_line2"], f"1 / {total}")]
+        for i, (c, photo_bytes) in enumerate(zip(cards, photo_results), 2):
+            images.append(make_content_card(photo_bytes, c.get("emoji", ""), c["title"], c["body"], f"{i} / {total}"))
+
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+
+        send_photo_group(chat_id, images)
+    except Exception as e:
+        send_message(chat_id, f"카드를 만드는 중 오류가 났어요: {e}")
+    finally:
+        ACTIVE_JOBS.pop(chat_id, None)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True)
+
+    # 텔레그램이 응답 지연으로 같은 update를 재전송하는 경우, 한 번만 처리
+    update_id = update.get("update_id")
+    if update_id is not None:
+        if update_id in PROCESSED_UPDATE_IDS:
+            return "ok"
+        PROCESSED_UPDATE_IDS.append(update_id)
+
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     if not chat_id:
@@ -381,49 +456,42 @@ def webhook():
     text = message.get("text", "") or message.get("caption", "")
     photos = message.get("photo")
 
+    if text.strip() in ("취소", "/취소", "cancel", "/cancel"):
+        job = ACTIVE_JOBS.get(chat_id)
+        if job:
+            job["cancelled"] = True
+        else:
+            send_message(chat_id, "지금 진행 중인 작업이 없어요.")
+        return "ok"
+
     if text.startswith("/start"):
         send_message(chat_id, (
             "뉴스 원문을 그대로 붙여넣어 보내주세요.\n"
             "표지는 하단 2줄 헤드라인, 본문은 이모지+제목+문단 형식으로\n"
             "카드마다 어울리는 사진과 함께 만들어드릴게요.\n\n"
-            "표지 사진을 직접 고르고 싶으면, 사진 먼저 보내고 원문을 이어서 보내주세요."
+            "표지 사진을 직접 고르고 싶으면, 사진 먼저 보내고 원문을 이어서 보내주세요.\n"
+            "만드는 중에 멈추고 싶으면 '취소'라고 보내주세요."
         ))
         return "ok"
 
-    try:
-        if photos:
-            file_id = photos[-1]["file_id"]
+    if photos:
+        file_id = photos[-1]["file_id"]
+        try:
             PENDING_PHOTOS[chat_id] = download_telegram_file(file_id)
             send_message(chat_id, "표지 사진 받았어요! 이제 원문을 이어서 보내주세요.")
-            return "ok"
+        except Exception as e:
+            send_message(chat_id, f"사진을 받는 중 오류가 났어요: {e}")
+        return "ok"
 
-        if not text.strip():
-            return "ok"
+    if not text.strip():
+        return "ok"
 
-        send_message(chat_id, "카드뉴스 만드는 중이에요, 잠시만 기다려주세요...")
+    if chat_id in ACTIVE_JOBS:
+        send_message(chat_id, "이미 카드뉴스를 만드는 중이에요! 중단하려면 '취소'라고 보내주세요.")
+        return "ok"
 
-        s = ai_structure_content(text)
-        cover_query = s.get("search_query", "business finance")
-        cards = s["cards"]
-
-        manual_photo = PENDING_PHOTOS.pop(chat_id, None)
-        used_photo_ids = set()
-        cover_photo = manual_photo if manual_photo else search_pexels_photo(cover_query, used_photo_ids)
-
-        total = 1 + len(cards)
-        images = [make_cover(cover_photo, s["thumbnail_line1"], s["thumbnail_line2"], f"1 / {total}")]
-
-        for i, c in enumerate(cards, 2):
-            q = c.get("search_query", cover_query)
-            try:
-                photo_bytes = search_pexels_photo(q, used_photo_ids)
-            except Exception:
-                photo_bytes = search_pexels_photo(cover_query, used_photo_ids)
-            images.append(make_content_card(photo_bytes, c.get("emoji", ""), c["title"], c["body"], f"{i} / {total}"))
-
-        send_photo_group(chat_id, images)
-    except Exception as e:
-        send_message(chat_id, f"카드를 만드는 중 오류가 났어요: {e}")
+    # 무거운 작업은 백그라운드 스레드로 넘기고, 텔레그램에는 즉시 응답 → 재전송(중복처리) 자체를 방지
+    threading.Thread(target=process_generation, args=(chat_id, text), daemon=True).start()
     return "ok"
 
 
