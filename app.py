@@ -213,18 +213,31 @@ def ai_structure_content(raw_text):
     return json.loads(text)
 
 
-def search_pexels_photo(query):
+def search_pexels_photo(query, used_ids=None):
     r = requests.get(
         "https://api.pexels.com/v1/search",
         headers={"Authorization": PEXELS_API_KEY},
-        params={"query": query, "per_page": 5, "orientation": "portrait"},
+        params={"query": query, "per_page": 10, "orientation": "portrait"},
         timeout=20,
     )
     r.raise_for_status()
     photos = r.json().get("photos", [])
     if not photos:
         raise Exception(f"'{query}' 사진을 찾지 못했어요")
-    return requests.get(photos[0]["src"]["large2x"], timeout=20).content
+
+    chosen = None
+    if used_ids is not None:
+        for p in photos:
+            if p["id"] not in used_ids:
+                chosen = p
+                break
+    if chosen is None:
+        chosen = photos[0]  # 전부 이미 썼으면(검색결과 부족) 어쩔 수 없이 첫번째라도 사용
+
+    if used_ids is not None:
+        used_ids.add(chosen["id"])
+
+    return requests.get(chosen["src"]["large2x"], timeout=20).content
 
 
 def load_photo(photo_bytes):
@@ -236,7 +249,7 @@ def load_photo(photo_bytes):
 def make_cover(photo_bytes, line1, line2, page_label):
     line1, line2 = strip_emoji(line1), strip_emoji(line2)
     img = load_photo(photo_bytes)
-    apply_gradient(img, top_alpha=40, bottom_alpha=190)
+    apply_gradient(img, top_alpha=75, bottom_alpha=225)
     draw = ImageDraw.Draw(img, "RGBA")
 
     draw_watermark(draw)
@@ -274,7 +287,7 @@ def make_cover(photo_bytes, line1, line2, page_label):
 # ============ 본문 카드: 사진 + 이모지·제목(가운데) + 문단(가운데, 볼드강조) ============
 def make_content_card(photo_bytes, emoji, title, body, page_label):
     img = load_photo(photo_bytes)
-    apply_gradient(img, top_alpha=120, bottom_alpha=170)
+    apply_gradient(img, top_alpha=160, bottom_alpha=205)
     draw = ImageDraw.Draw(img, "RGBA")
 
     draw_watermark(draw)
@@ -392,7 +405,8 @@ def webhook():
         cards = s["cards"]
 
         manual_photo = PENDING_PHOTOS.pop(chat_id, None)
-        cover_photo = manual_photo if manual_photo else search_pexels_photo(cover_query)
+        used_photo_ids = set()
+        cover_photo = manual_photo if manual_photo else search_pexels_photo(cover_query, used_photo_ids)
 
         total = 1 + len(cards)
         images = [make_cover(cover_photo, s["thumbnail_line1"], s["thumbnail_line2"], f"1 / {total}")]
@@ -400,9 +414,9 @@ def webhook():
         for i, c in enumerate(cards, 2):
             q = c.get("search_query", cover_query)
             try:
-                photo_bytes = search_pexels_photo(q)
+                photo_bytes = search_pexels_photo(q, used_photo_ids)
             except Exception:
-                photo_bytes = search_pexels_photo(cover_query)
+                photo_bytes = search_pexels_photo(cover_query, used_photo_ids)
             images.append(make_content_card(photo_bytes, c.get("emoji", ""), c["title"], c["body"], f"{i} / {total}"))
 
         send_photo_group(chat_id, images)
