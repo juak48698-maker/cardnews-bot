@@ -53,12 +53,66 @@ def wrap_text(draw, text, fnt, max_width):
     return lines
 
 
+def strip_emoji(text):
+    """폰트가 지원하지 않는 이모지 등을 안전하게 제거 (AI가 실수로 넣어도 깨진 박스 방지)"""
+    pattern = re.compile(
+        "["
+        "\U0001F300-\U0001FAFF"
+        "\U00002600-\U000027BF"
+        "\U0001F1E6-\U0001F1FF"
+        "\U00002B00-\U00002BFF"
+        "\U0001F000-\U0001F0FF"
+        "\U0000FE0F"
+        "]+", flags=re.UNICODE)
+    return pattern.sub("", text).strip()
+
+
 def apply_gradient(img, top_alpha, bottom_alpha):
     """이미지 전체에 위→아래로 어두워지는 그라데이션(오버레이) 적용"""
     draw = ImageDraw.Draw(img, "RGBA")
     for y in range(H):
         alpha = int(top_alpha + (bottom_alpha - top_alpha) * (y / H))
         draw.line([(0, y), (W, y)], fill=(0, 0, 0, alpha))
+
+
+def draw_watermark(draw):
+    """배경 밝기와 상관없이 항상 잘 보이도록 반투명 검은 배경 위에 워터마크 표시"""
+    text_w = draw.textlength(HANDLE, font=font(F_BODY, 24))
+    pad_x, pad_y = 16, 10
+    x0, y0 = SAFE_PAD - pad_x, 60 - pad_y
+    x1, y1 = SAFE_PAD + text_w + pad_x, 60 + 24 + pad_y
+    draw.rounded_rectangle([x0, y0, x1, y1], radius=8, fill=(0, 0, 0, 130))
+    draw.text((SAFE_PAD, 60), HANDLE, font=font(F_BODY, 24), fill=WHITE)
+
+
+def draw_title_marker(draw, x, y, size):
+    """이모지 대신 폰트에 항상 있는 브랜드컬러 사각 마커로 제목 앞부분 표시 (폴백용)"""
+    m = int(size * 0.32)
+    top = y + int(size * 0.22)
+    draw.rounded_rectangle([x, top, x + m, top + m], radius=4, fill=BRAND_GREEN)
+    return x + m + int(size * 0.28)
+
+
+def fetch_emoji_image(emoji_char, size=96):
+    """Twemoji CDN에서 컬러 이모지 이미지를 가져옴. 실패하면 None 반환 (호출부에서 폴백 처리)"""
+    if not emoji_char:
+        return None
+    try:
+        cps = [c for c in emoji_char if ord(c) not in (0xFE0F, 0x200D) and not (0xD800 <= ord(c) <= 0xDFFF)]
+        if not cps:
+            return None
+        if len(cps) == 1:
+            codepoint = f"{ord(cps[0]):x}"
+        else:
+            codepoint = "-".join(f"{ord(c):x}" for c in cps)
+        url = f"https://cdn.jsdelivr.net/gh/jdecked/twemoji@latest/assets/72x72/{codepoint}.png"
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return None
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        return img.resize((size, size), Image.LANCZOS)
+    except Exception:
+        return None
 
 
 # ============ 볼드(**강조**) 문단 줄바꿈 + 가운데 정렬 렌더링 ============
@@ -125,8 +179,8 @@ def ai_structure_content(raw_text):
   "search_query": "표지 배경 스톡사진 검색용 영어 키워드 2~4단어",
   "cards": [
     {{
-      "emoji": "이 카드 내용을 대표하는 이모지 하나",
-      "title": "카드 제목 (짧고 명확하게)",
+      "emoji": "이 카드 내용을 대표하는 심플한 이모지 딱 1개 (국기·합성 이모지 말고 기본 이모지로)",
+      "title": "카드 제목 (짧고 명확하게, 이모지 넣지 말 것)",
       "body": "문단형 본문 2~4문장. 그중 가장 중요한 구절 하나는 **이렇게** 별표 두 개로 감싸서 강조 표시해줘.",
       "search_query": "이 카드 내용과 어울리는 배경 스톡사진 영어 검색어 2~4단어"
     }}
@@ -135,6 +189,7 @@ def ai_structure_content(raw_text):
 
 - cards는 원문 분량에 따라 2~10장 사이로 알아서 나눠줘
 - body는 불릿 없이 자연스럽게 이어지는 문단으로, 강조 구절은 딱 하나만 **로 감싸기
+- 중요: thumbnail_line1, thumbnail_line2, title, body 안에는 이모지를 절대 넣지 마. 이모지는 각 카드의 emoji 필드에만 딱 1개씩 넣어줘
 - 원문:
 {raw_text}
 """
@@ -179,11 +234,12 @@ def load_photo(photo_bytes):
 
 # ============ 표지: 사진 + 하단 고정 2줄 헤드라인 ============
 def make_cover(photo_bytes, line1, line2, page_label):
+    line1, line2 = strip_emoji(line1), strip_emoji(line2)
     img = load_photo(photo_bytes)
     apply_gradient(img, top_alpha=40, bottom_alpha=190)
     draw = ImageDraw.Draw(img, "RGBA")
 
-    draw.text((SAFE_PAD, 60), HANDLE, font=font(F_MONO, 24), fill=WHITE)
+    draw_watermark(draw)
 
     safe_width = W - SAFE_PAD * 2 - 40
     size = 62
@@ -221,18 +277,20 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
     apply_gradient(img, top_alpha=120, bottom_alpha=170)
     draw = ImageDraw.Draw(img, "RGBA")
 
-    draw.text((SAFE_PAD, 60), HANDLE, font=font(F_MONO, 24), fill=WHITE)
+    draw_watermark(draw)
 
     safe_width = W - SAFE_PAD * 2
 
-    title_text = f"{emoji} {title}".strip()
+    title_text = strip_emoji(title)
+    body = strip_emoji(body)
     title_size = 48
     body_size = 32
     title_lines, body_lines = [], []
     for attempt in range(4):
         title_lines = wrap_text(draw, title_text, font(F_TITLE, title_size), safe_width)
         body_lines = wrap_mixed_tokens(draw, tokenize_bold(body), body_size, safe_width)
-        total_h = len(title_lines) * int(title_size * 1.3) + 60 + len(body_lines) * int(body_size * 1.7)
+        marker_h = 76
+        total_h = marker_h + len(title_lines) * int(title_size * 1.3) + 60 + len(body_lines) * int(body_size * 1.7)
         if total_h <= (H - 340) or attempt == 3:
             break
         title_size -= 4
@@ -240,8 +298,18 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
 
     title_h = len(title_lines) * int(title_size * 1.3)
     body_h = len(body_lines) * int(body_size * 1.7)
-    total_h = title_h + 60 + body_h
+    marker_h = 76
+    total_h = marker_h + title_h + 60 + body_h
     y = (H - total_h) / 2
+
+    # 이모지 이미지를 가운데 배치 (가져오기 실패 시 브랜드컬러 마커 바로 대체)
+    emoji_img = fetch_emoji_image(emoji, size=64)
+    if emoji_img:
+        img.paste(emoji_img, (int((W - 64) / 2), int(y)), emoji_img)
+    else:
+        bar_w, bar_h = 54, 7
+        draw.rounded_rectangle([(W - bar_w) / 2, y + 28, (W + bar_w) / 2, y + 28 + bar_h], radius=3, fill=BRAND_GREEN)
+    y += marker_h
 
     for line in title_lines:
         w = draw.textlength(line, font=font(F_TITLE, title_size))
