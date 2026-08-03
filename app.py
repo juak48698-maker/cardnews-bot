@@ -300,10 +300,12 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
     body_size = 32
     title_lines, body_lines = [], []
     for attempt in range(4):
-        title_lines = wrap_text(draw, title_text, font(F_TITLE, title_size), safe_width)
+        emoji_size = int(title_size * 0.85)
+        gap = int(title_size * 0.3)
+        narrowed_width = safe_width - emoji_size - gap  # 이모지+간격만큼 좁힌 너비로 통일해서 줄바꿈
+        title_lines = wrap_text(draw, title_text, font(F_TITLE, title_size), narrowed_width)
         body_lines = wrap_mixed_tokens(draw, tokenize_bold(body), body_size, safe_width)
-        marker_h = 76
-        total_h = marker_h + len(title_lines) * int(title_size * 1.3) + 60 + len(body_lines) * int(body_size * 1.7)
+        total_h = len(title_lines) * int(title_size * 1.3) + 60 + len(body_lines) * int(body_size * 1.7)
         if total_h <= (H - 340) or attempt == 3:
             break
         title_size -= 4
@@ -311,22 +313,22 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
 
     title_h = len(title_lines) * int(title_size * 1.3)
     body_h = len(body_lines) * int(body_size * 1.7)
-    marker_h = 76
-    total_h = marker_h + title_h + 60 + body_h
+    total_h = title_h + 60 + body_h
     y = (H - total_h) / 2
 
-    # 이모지 이미지를 가운데 배치 (가져오기 실패 시 브랜드컬러 마커 바로 대체)
-    emoji_img = fetch_emoji_image(emoji, size=64)
-    if emoji_img:
-        img.paste(emoji_img, (int((W - 64) / 2), int(y)), emoji_img)
-    else:
-        bar_w, bar_h = 54, 7
-        draw.rounded_rectangle([(W - bar_w) / 2, y + 28, (W + bar_w) / 2, y + 28 + bar_h], radius=3, fill=BRAND_GREEN)
-    y += marker_h
+    emoji_img = fetch_emoji_image(emoji, size=emoji_size)
 
-    for line in title_lines:
-        w = draw.textlength(line, font=font(F_TITLE, title_size))
-        draw.text(((W - w) / 2, y), line, font=font(F_TITLE, title_size), fill=WHITE)
+    for idx, line in enumerate(title_lines):
+        text_w = draw.textlength(line, font=font(F_TITLE, title_size))
+        if idx == 0 and emoji_img:
+            gap = int(title_size * 0.3)
+            total_w = emoji_size + gap + text_w
+            x = (W - total_w) / 2
+            emoji_y = int(y + (title_size * 1.3 - emoji_size) / 2)
+            img.paste(emoji_img, (int(x), emoji_y), emoji_img)
+            draw.text((x + emoji_size + gap, y), line, font=font(F_TITLE, title_size), fill=WHITE)
+        else:
+            draw.text(((W - text_w) / 2, y), line, font=font(F_TITLE, title_size), fill=WHITE)
         y += int(title_size * 1.3)
 
     y += 60
