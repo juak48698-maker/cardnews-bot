@@ -249,13 +249,13 @@ def load_photo(photo_bytes):
 def make_cover(photo_bytes, line1, line2, page_label):
     line1, line2 = strip_emoji(line1), strip_emoji(line2)
     img = load_photo(photo_bytes)
-    apply_gradient(img, top_alpha=75, bottom_alpha=225)
+    apply_gradient(img, top_alpha=110, bottom_alpha=245)
     draw = ImageDraw.Draw(img, "RGBA")
 
     draw_watermark(draw)
 
     safe_width = W - SAFE_PAD * 2 - 40
-    size = 62
+    size = 80
     l1_lines = wrap_text(draw, line1, font(F_TITLE, size), safe_width)
     l2_lines = wrap_text(draw, line2, font(F_TITLE, size), safe_width)
     while (len(l1_lines) + len(l2_lines)) > 4 and size > 40:
@@ -287,7 +287,7 @@ def make_cover(photo_bytes, line1, line2, page_label):
 # ============ 본문 카드: 사진 + 이모지·제목(가운데) + 문단(가운데, 볼드강조) ============
 def make_content_card(photo_bytes, emoji, title, body, page_label):
     img = load_photo(photo_bytes)
-    apply_gradient(img, top_alpha=160, bottom_alpha=205)
+    apply_gradient(img, top_alpha=195, bottom_alpha=230)
     draw = ImageDraw.Draw(img, "RGBA")
 
     draw_watermark(draw)
@@ -296,8 +296,8 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
 
     title_text = strip_emoji(title)
     body = strip_emoji(body)
-    title_size = 48
-    body_size = 32
+    title_size = 56
+    body_size = 38
     title_lines, body_lines = [], []
     for attempt in range(4):
         emoji_size = int(title_size * 0.85)
