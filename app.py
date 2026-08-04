@@ -37,6 +37,7 @@ ACTIVE_JOBS = {}  # chat_id -> {"cancelled": bool}
 PROCESSED_UPDATE_IDS = deque(maxlen=2000)  # 텔레그램 재전송(같은 update_id) 중복 처리 방지
 PHOTO_LOCK = threading.Lock()  # used_photo_ids 동시접근 보호 (병렬 사진검색용)
 PENDING_TOPICS = {}  # chat_id -> ["/추천"으로 나온 주제 리스트]
+SELECTED_TOPIC = {}  # chat_id -> 버튼으로 고른 주제 (콘텐츠 종류 선택 전까지 임시 보관)
 
 
 def font(path, size):
@@ -295,21 +296,46 @@ def call_claude(prompt, max_tokens=1500):
         timeout=60,
     )
     resp.raise_for_status()
-    text = resp.json()["content"][0]["text"].strip()
-    return re.sub(r"^```json\s*|\s*```$", "", text.strip())
+    blocks = resp.json().get("content", [])
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    return text.strip()
+
+
+def extract_json(text):
+    """앞뒤에 설명이 붙어오거나 코드블록으로 감싸져도 안전하게 JSON 부분만 추출"""
+    text = re.sub(r"^```json\s*|^```\s*|\s*```$", "", text.strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"AI 응답에서 JSON을 찾지 못했어요: {text[:200]!r}")
+    return json.loads(text[start:end + 1])
+
+
+def call_claude_json(prompt, max_tokens=1500, retries=2):
+    """call_claude + JSON 파싱을 하나로 묶고, 실패하면 자동 재시도"""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            text = call_claude(prompt, max_tokens=max_tokens)
+            return extract_json(text)
+        except Exception as e:
+            last_err = e
+            continue
+    raise Exception(f"AI 응답을 이해하지 못했어요 (재시도 {retries}번 실패): {last_err}")
 
 
 def ai_generate_topics(raw_data):
-    prompt = f"""다음은 최근 금융/투자 관련 유튜브 인기 영상 제목과 구글 트렌드 급상승 연관검색어야.
+    prompt = f"""다음은 최근 금융/투자 관련 유튜브 인기 영상 제목(조회수 포함)과 구글 트렌드 급상승 연관검색어야.
 
 {raw_data if raw_data.strip() else "(데이터 없음, 최근 시장 상황을 참고해서 일반적으로 관심 높은 주제로 대신 뽑아줘)"}
 
 이 데이터를 참고해서, 시청자들이 실제로 궁금해할만한 콘텐츠 주제를 8개 뽑아줘.
 각 주제는 짧고 흥미로운 질문 형태로.
+**중요: 근거가 된 영상의 조회수가 높거나, 여러 데이터에서 반복적으로 나타나는 주제일수록 인기도가 높은 것으로 보고, 1번에 가장 인기도 높은 주제, 8번에 가장 낮은 주제가 오도록 인기도 순으로 정렬해줘.**
 아래 JSON 형식으로만 답해, 다른 설명 붙이지 마:
 {{"topics": ["주제/질문 1", "주제/질문 2", "..."]}}
 """
-    return json.loads(call_claude(prompt, max_tokens=1200))["topics"]
+    return call_claude_json(prompt, max_tokens=1200)["topics"]
 
 
 def ai_generate_package(topic):
@@ -330,7 +356,7 @@ def ai_generate_package(topic):
 }}
 cards는 2~3개로 (표지까지 합쳐 총 3~4장이 되도록).
 """
-    return json.loads(call_claude(prompt, max_tokens=2000))
+    return call_claude_json(prompt, max_tokens=2000)
 
 
 def search_pexels_photo(query, used_ids=None, lock=None):
@@ -491,6 +517,21 @@ def send_message(chat_id, text):
     requests.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": chat_id, "text": text})
 
 
+def send_buttons(chat_id, text, buttons):
+    """buttons: [(라벨, callback_data), ...] 한 줄에 버튼 하나씩"""
+    keyboard = {"inline_keyboard": [[{"text": label, "callback_data": data}] for label, data in buttons]}
+    requests.post(f"{TELEGRAM_API}/sendMessage", data={
+        "chat_id": chat_id, "text": text, "reply_markup": json.dumps(keyboard),
+    })
+
+
+def answer_callback(callback_id, text=None):
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+    requests.post(f"{TELEGRAM_API}/answerCallbackQuery", data=payload)
+
+
 def download_telegram_file(file_id):
     r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=20)
     file_path = r.json()["result"]["file_path"]
@@ -561,26 +602,31 @@ def process_recommend(chat_id):
             return
         topics = ai_generate_topics(raw)
         PENDING_TOPICS[chat_id] = topics
-        lines = [f"{i+1}. {t}" for i, t in enumerate(topics)]
-        send_message(chat_id, "요즘 관심 높은 주제들이에요, 번호로 골라서 답장해주세요 👇\n\n" + "\n".join(lines))
+        buttons = [(f"{i+1}. {t[:55]}{'...' if len(t) > 55 else ''}", f"topic:{i}") for i, t in enumerate(topics)]
+        send_buttons(chat_id, "요즘 관심 높은 주제들이에요 (인기도 높은 순). 버튼을 눌러 골라주세요 👇", buttons)
     except Exception as e:
         send_message(chat_id, f"주제를 찾는 중 오류가 났어요: {e}")
     finally:
         ACTIVE_JOBS.pop(chat_id, None)
 
 
-def process_package(chat_id, topic):
+def process_package(chat_id, topic, kind="both"):
     job = {"cancelled": False}
     ACTIVE_JOBS[chat_id] = job
     try:
-        send_message(chat_id, f"'{topic}' 주제로 대본+카드뉴스 만드는 중이에요...")
+        label = {"reels": "릴스 대본", "cards": "카드뉴스", "both": "대본+카드뉴스"}.get(kind, "콘텐츠")
+        send_message(chat_id, f"'{topic}' 주제로 {label} 만드는 중이에요...")
         pkg = ai_generate_package(topic)
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
 
-        send_message(chat_id, "📝 릴스 대본 (버전 A)\n\n" + pkg["reels_script_a"])
-        send_message(chat_id, "📝 릴스 대본 (버전 B)\n\n" + pkg["reels_script_b"])
+        if kind in ("reels", "both"):
+            send_message(chat_id, "📝 릴스 대본 (버전 A)\n\n" + pkg["reels_script_a"])
+            send_message(chat_id, "📝 릴스 대본 (버전 B)\n\n" + pkg["reels_script_b"])
+
+        if kind not in ("cards", "both"):
+            return
 
         cover_query = pkg.get("search_query", "business finance")
         cards = pkg["cards"][:9]
@@ -628,6 +674,46 @@ def webhook():
             return "ok"
         PROCESSED_UPDATE_IDS.append(update_id)
 
+    # ===== 버튼 클릭(callback_query) 처리 =====
+    callback = update.get("callback_query")
+    if callback:
+        cb_chat_id = callback.get("message", {}).get("chat", {}).get("id")
+        cb_data = callback.get("data", "")
+        cb_id = callback.get("id")
+        answer_callback(cb_id)
+
+        if cb_chat_id is None:
+            return "ok"
+
+        if cb_data.startswith("topic:"):
+            idx = int(cb_data.split(":", 1)[1])
+            topics = PENDING_TOPICS.get(cb_chat_id, [])
+            if 0 <= idx < len(topics):
+                topic = topics[idx]
+                SELECTED_TOPIC[cb_chat_id] = topic
+                send_buttons(cb_chat_id, f"'{topic}'\n\n뭘 만들어드릴까요?", [
+                    ("📝 릴스 대본만", "type:reels"),
+                    ("🖼️ 카드뉴스만", "type:cards"),
+                    ("🎬 둘 다", "type:both"),
+                ])
+            else:
+                send_message(cb_chat_id, "주제 목록이 만료됐어요. '/추천'을 다시 입력해주세요.")
+            return "ok"
+
+        if cb_data.startswith("type:"):
+            kind = cb_data.split(":", 1)[1]
+            topic = SELECTED_TOPIC.pop(cb_chat_id, None)
+            if not topic:
+                send_message(cb_chat_id, "주제가 만료됐어요. '/추천'을 다시 입력해주세요.")
+                return "ok"
+            if cb_chat_id in ACTIVE_JOBS:
+                send_message(cb_chat_id, "이미 만드는 중이에요! 중단하려면 '취소'라고 보내주세요.")
+                return "ok"
+            threading.Thread(target=process_package, args=(cb_chat_id, topic, kind), daemon=True).start()
+            return "ok"
+
+        return "ok"
+
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     if not chat_id:
@@ -673,17 +759,6 @@ def webhook():
 
     if text.strip() in ("/추천", "추천"):
         threading.Thread(target=process_recommend, args=(chat_id,), daemon=True).start()
-        return "ok"
-
-    # "/추천"으로 받은 주제 목록 중 번호로 답장한 경우
-    if chat_id in PENDING_TOPICS and text.strip().isdigit():
-        idx = int(text.strip()) - 1
-        topics = PENDING_TOPICS.get(chat_id, [])
-        if 0 <= idx < len(topics):
-            topic = topics.pop(idx)
-            threading.Thread(target=process_package, args=(chat_id, topic), daemon=True).start()
-        else:
-            send_message(chat_id, f"1~{len(topics)} 사이의 번호로 보내주세요.")
         return "ok"
 
     # 무거운 작업은 백그라운드 스레드로 넘기고, 텔레그램에는 즉시 응답 → 재전송(중복처리) 자체를 방지
