@@ -15,6 +15,9 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+SEED_KEYWORDS = ["주식", "미국주식", "금리", "환율", "반도체", "비트코인", "부동산", "코스피"]
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
@@ -33,6 +36,7 @@ PENDING_PHOTOS = {}
 ACTIVE_JOBS = {}  # chat_id -> {"cancelled": bool}
 PROCESSED_UPDATE_IDS = deque(maxlen=2000)  # 텔레그램 재전송(같은 update_id) 중복 처리 방지
 PHOTO_LOCK = threading.Lock()  # used_photo_ids 동시접근 보호 (병렬 사진검색용)
+PENDING_TOPICS = {}  # chat_id -> ["/추천"으로 나온 주제 리스트]
 
 
 def font(path, size):
@@ -218,6 +222,115 @@ def ai_structure_content(raw_text):
     text = resp.json()["content"][0]["text"].strip()
     text = re.sub(r"^```json\s*|\s*```$", "", text.strip())
     return json.loads(text)
+
+
+def youtube_top_videos(query, max_results=4):
+    """최근 7일 내 업로드된 영상 중 조회수 높은 순으로 가져옴"""
+    import datetime
+    published_after = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = requests.get("https://www.googleapis.com/youtube/v3/search", params={
+        "part": "snippet", "q": query, "type": "video", "order": "viewCount",
+        "publishedAfter": published_after, "maxResults": max_results,
+        "regionCode": "KR", "relevanceLanguage": "ko", "key": YOUTUBE_API_KEY,
+    }, timeout=15)
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    video_ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+    if not video_ids:
+        return []
+    r2 = requests.get("https://www.googleapis.com/youtube/v3/videos", params={
+        "part": "snippet,statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY,
+    }, timeout=15)
+    r2.raise_for_status()
+    out = [{"title": v["snippet"]["title"], "views": int(v["statistics"].get("viewCount", 0))}
+           for v in r2.json().get("items", [])]
+    out.sort(key=lambda x: x["views"], reverse=True)
+    return out
+
+
+def google_trends_rising(keyword):
+    """해당 키워드와 관련해서 요즘 급상승 중인 연관 검색어"""
+    try:
+        from pytrends.request import TrendReq
+        pytrends = TrendReq(hl="ko-KR", tz=540)
+        pytrends.build_payload([keyword], timeframe="now 7-d", geo="KR")
+        related = pytrends.related_queries()
+        rising = related.get(keyword, {}).get("rising")
+        if rising is None or rising.empty:
+            return []
+        return rising["query"].tolist()[:5]
+    except Exception:
+        return []
+
+
+def collect_trend_data():
+    """시드 키워드 중 일부를 뽑아 유튜브+구글트렌드 데이터를 텍스트로 모음"""
+    import random
+    picks = random.sample(SEED_KEYWORDS, k=min(4, len(SEED_KEYWORDS)))
+    lines = []
+    for kw in picks:
+        try:
+            for v in youtube_top_videos(kw, max_results=4):
+                lines.append(f"[유튜브 인기/{kw}] {v['title']} (조회수 {v['views']:,})")
+        except Exception:
+            pass
+        for q in google_trends_rising(kw):
+            lines.append(f"[구글트렌드 급상승/{kw}] {q}")
+    return "\n".join(lines)
+
+
+def call_claude(prompt, max_tokens=1500):
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    text = resp.json()["content"][0]["text"].strip()
+    return re.sub(r"^```json\s*|\s*```$", "", text.strip())
+
+
+def ai_generate_topics(raw_data):
+    prompt = f"""다음은 최근 금융/투자 관련 유튜브 인기 영상 제목과 구글 트렌드 급상승 연관검색어야.
+
+{raw_data if raw_data.strip() else "(데이터 없음, 최근 시장 상황을 참고해서 일반적으로 관심 높은 주제로 대신 뽑아줘)"}
+
+이 데이터를 참고해서, 시청자들이 실제로 궁금해할만한 콘텐츠 주제를 8개 뽑아줘.
+각 주제는 짧고 흥미로운 질문 형태로.
+아래 JSON 형식으로만 답해, 다른 설명 붙이지 마:
+{{"topics": ["주제/질문 1", "주제/질문 2", "..."]}}
+"""
+    return json.loads(call_claude(prompt, max_tokens=1200))["topics"]
+
+
+def ai_generate_package(topic):
+    prompt = f"""주제: {topic}
+
+이 주제로 콘텐츠 패키지를 만들어줘. 아래 JSON 형식으로만 답해, 다른 설명 붙이지 마.
+이모지는 각 지정된 필드에만 넣고, 그 외 텍스트(제목/본문/대본)에는 절대 넣지 마.
+
+{{
+  "reels_script_a": "30초 분량 릴스 대본 버전A. 실제 말하는 대사 그대로, 후킹 문장으로 시작해서 본론-마무리 구조로",
+  "reels_script_b": "30초 분량 릴스 대본 버전B. 버전A와 다른 각도나 톤으로 (예: 하나는 정보전달형, 하나는 스토리텔링형)",
+  "thumbnail_line1": "카드뉴스 표지 첫 줄 (짧게)",
+  "thumbnail_line2": "카드뉴스 표지 둘째 줄 (강조 문구)",
+  "search_query": "표지 배경 스톡사진 영어 검색어 2~4단어",
+  "cards": [
+    {{"emoji": "이모지 1개", "title": "카드 제목", "body": "문단형 본문 2~3문장, 핵심 구절 하나는 **강조**", "search_query": "이 카드용 영어 사진검색어"}}
+  ]
+}}
+cards는 2~3개로 (표지까지 합쳐 총 3~4장이 되도록).
+"""
+    return json.loads(call_claude(prompt, max_tokens=2000))
 
 
 def search_pexels_photo(query, used_ids=None, lock=None):
@@ -437,6 +550,73 @@ def process_generation(chat_id, text):
         ACTIVE_JOBS.pop(chat_id, None)
 
 
+def process_recommend(chat_id):
+    job = {"cancelled": False}
+    ACTIVE_JOBS[chat_id] = job
+    try:
+        send_message(chat_id, "요즘 뜨는 금융/투자 주제를 훑어보는 중이에요, 잠시만요...")
+        raw = collect_trend_data()
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+        topics = ai_generate_topics(raw)
+        PENDING_TOPICS[chat_id] = topics
+        lines = [f"{i+1}. {t}" for i, t in enumerate(topics)]
+        send_message(chat_id, "요즘 관심 높은 주제들이에요, 번호로 골라서 답장해주세요 👇\n\n" + "\n".join(lines))
+    except Exception as e:
+        send_message(chat_id, f"주제를 찾는 중 오류가 났어요: {e}")
+    finally:
+        ACTIVE_JOBS.pop(chat_id, None)
+
+
+def process_package(chat_id, topic):
+    job = {"cancelled": False}
+    ACTIVE_JOBS[chat_id] = job
+    try:
+        send_message(chat_id, f"'{topic}' 주제로 대본+카드뉴스 만드는 중이에요...")
+        pkg = ai_generate_package(topic)
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+
+        send_message(chat_id, "📝 릴스 대본 (버전 A)\n\n" + pkg["reels_script_a"])
+        send_message(chat_id, "📝 릴스 대본 (버전 B)\n\n" + pkg["reels_script_b"])
+
+        cover_query = pkg.get("search_query", "business finance")
+        cards = pkg["cards"][:9]
+        used_photo_ids = set()
+        cover_photo = search_pexels_photo(cover_query, used_photo_ids, PHOTO_LOCK)
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+
+        total = 1 + len(cards)
+
+        def fetch_one(c):
+            q = c.get("search_query", cover_query)
+            try:
+                return search_pexels_photo(q, used_photo_ids, PHOTO_LOCK)
+            except Exception:
+                return search_pexels_photo(cover_query, used_photo_ids, PHOTO_LOCK)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            photo_results = list(pool.map(fetch_one, cards))
+
+        if job["cancelled"]:
+            send_message(chat_id, "생성을 중단했어요.")
+            return
+
+        images = [make_cover(cover_photo, pkg["thumbnail_line1"], pkg["thumbnail_line2"], f"1 / {total}")]
+        for i, (c, photo_bytes) in enumerate(zip(cards, photo_results), 2):
+            images.append(make_content_card(photo_bytes, c.get("emoji", ""), c["title"], c["body"], f"{i} / {total}"))
+
+        send_photo_group(chat_id, images)
+    except Exception as e:
+        send_message(chat_id, f"패키지를 만드는 중 오류가 났어요: {e}")
+    finally:
+        ACTIVE_JOBS.pop(chat_id, None)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True)
@@ -470,7 +650,8 @@ def webhook():
             "표지는 하단 2줄 헤드라인, 본문은 이모지+제목+문단 형식으로\n"
             "카드마다 어울리는 사진과 함께 만들어드릴게요.\n\n"
             "표지 사진을 직접 고르고 싶으면, 사진 먼저 보내고 원문을 이어서 보내주세요.\n"
-            "만드는 중에 멈추고 싶으면 '취소'라고 보내주세요."
+            "만드는 중에 멈추고 싶으면 '취소'라고 보내주세요.\n\n"
+            "키워드 없이 요즘 뜨는 주제를 추천받고 싶으면 '/추천'이라고 보내주세요."
         ))
         return "ok"
 
@@ -487,7 +668,22 @@ def webhook():
         return "ok"
 
     if chat_id in ACTIVE_JOBS:
-        send_message(chat_id, "이미 카드뉴스를 만드는 중이에요! 중단하려면 '취소'라고 보내주세요.")
+        send_message(chat_id, "이미 만드는 중이에요! 중단하려면 '취소'라고 보내주세요.")
+        return "ok"
+
+    if text.strip() in ("/추천", "추천"):
+        threading.Thread(target=process_recommend, args=(chat_id,), daemon=True).start()
+        return "ok"
+
+    # "/추천"으로 받은 주제 목록 중 번호로 답장한 경우
+    if chat_id in PENDING_TOPICS and text.strip().isdigit():
+        idx = int(text.strip()) - 1
+        topics = PENDING_TOPICS.get(chat_id, [])
+        if 0 <= idx < len(topics):
+            topic = topics.pop(idx)
+            threading.Thread(target=process_package, args=(chat_id, topic), daemon=True).start()
+        else:
+            send_message(chat_id, f"1~{len(topics)} 사이의 번호로 보내주세요.")
         return "ok"
 
     # 무거운 작업은 백그라운드 스레드로 넘기고, 텔레그램에는 즉시 응답 → 재전송(중복처리) 자체를 방지
