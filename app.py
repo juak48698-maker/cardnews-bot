@@ -81,6 +81,11 @@ def strip_emoji(text):
     return pattern.sub("", text).strip()
 
 
+def flatten_text(text):
+    """줄바꿈이 섞여있으면 draw.textlength()가 에러나므로, 렌더링 전에 한 줄로 평탄화"""
+    return re.sub(r"\s+", " ", (text or "").replace("\n", " ").replace("\r", " ")).strip()
+
+
 def apply_gradient(img, top_alpha, bottom_alpha):
     """이미지 전체에 위→아래로 어두워지는 그라데이션(오버레이) 적용"""
     draw = ImageDraw.Draw(img, "RGBA")
@@ -221,6 +226,13 @@ def ai_generate_5slides(source_text):
 - 문장은 짧고 단정적으로 (설명체 X, 선언체 O)
 - 각 슬라이드는 다음 장이 궁금해지는 여운으로 마무리
 
+[슬라이드4에서 예고한 체크리스트를 실제로 작성해줘 — DM으로 보낼 자료용]
+- 슬라이드4에서는 예고만 하고 카드에는 절대 내용을 공개하지 않지만, 이 체크리스트는 실제로 DM으로 보낼 자료라서 진짜로 채워야 해
+- 반드시 [참고 자료]에 있는 사실관계에서만 도출해, 참고자료에 없는 새로운 사실이나 수치는 절대 지어내지 마
+- 3~5개 항목, 각 항목은 "~확인하기", "~점검하기" 같은 행동형 문장으로
+- 특정 종목 매수/매도 지시, 목표가, 수익률 예측 같은 직접적 투자 지시는 절대 쓰지 마 (정보 제공까지만)
+- 각 항목 뒤에 " — " 다음에 참고자료의 어떤 사실과 연결되는지 1줄로 짧게 덧붙여줘
+
 ### 출력 (아래 JSON 형식으로만, 다른 설명 붙이지 마)
 {{
   "cover": {{"line1": "슬라이드1 첫 줄", "line2": "슬라이드1 둘째 줄(강조)", "search_query": "위기감 도는 배경사진 영어검색어 2~4단어"}},
@@ -230,11 +242,12 @@ def ai_generate_5slides(source_text):
     {{"emoji": "🙌", "title": "슬라이드4 헤드라인(질문형)", "body": "체크리스트 있다는 예고만, 내용 절대 공개 금지", "search_query": "영어검색어"}},
     {{"emoji": "💬", "title": "슬라이드5 헤드라인", "body": "팔로우+댓글유도+DM안내 문구", "search_query": "영어검색어"}}
   ],
-  "caption": "질문 1줄 + 투표/댓글 유도, 짧게"
+  "caption": "질문 1줄 + 투표/댓글 유도, 짧게",
+  "checklist": ["점검포인트1 — 근거자료 사실 연결", "점검포인트2 — 근거자료 사실 연결", "..."]
 }}
 title, body, line1, line2, caption 안에는 이모지 넣지 마 (emoji 필드에만 딱 1개씩).
 """
-    return call_claude_json(prompt, max_tokens=2000)
+    return call_claude_json(prompt, max_tokens=2200)
 
 
 def youtube_top_videos(query, max_results=4):
@@ -439,9 +452,17 @@ def ai_generate_topics(raw_data):
 def ai_generate_package(topic_question, source_text, verified=True):
     if verified:
         fact_note = "아래는 실제로 확인된 뉴스 기사야. 여기 있는 사실관계와 수치만 사용하고, 없는 내용은 절대 지어내지 마."
+        checklist_note = (
+            "checklist는 반드시 근거자료의 사실관계에서만 도출해. 각 항목 뒤에 ' — ' 다음에 "
+            "근거자료의 어떤 사실과 연결되는지 1줄로 덧붙여줘."
+        )
     else:
         fact_note = ("이 주제를 뒷받침하는 실제 기사를 찾지 못했어. 구체적인 수치·통계·날짜를 새로 지어내지 말고, "
                      "'~하는 분위기다', '~라는 우려가 나온다' 같은 방향성 위주의 조심스러운 표현만 사용해.")
+        checklist_note = (
+            "실제 기사로 확인되지 않은 주제이므로, checklist는 구체적 수치 없이 "
+            "'이런 상황에서 일반적으로 점검하면 좋은 것들' 위주의 일반론적 프레임워크로만 작성해."
+        )
 
     prompt = f"""주제: {topic_question}
 
@@ -466,6 +487,12 @@ def ai_generate_package(topic_question, source_text, verified=True):
 - slides[3](슬라이드5/CTA): 팔로우+댓글 유도, DM으로 자료 보내준다는 문구
 문장은 짧고 단정적으로, 각 슬라이드는 다음 장이 궁금해지는 여운으로 마무리.
 
+[슬라이드4에서 예고한 체크리스트를 실제로 작성해줘 — DM으로 보낼 자료용]
+- 카드에는 절대 내용을 공개하지 않지만, 이 체크리스트는 실제로 DM으로 보낼 자료라서 진짜로 채워야 해
+- {checklist_note}
+- 3~5개 항목, 각 항목은 "~확인하기", "~점검하기" 같은 행동형 문장으로
+- 특정 종목 매수/매도 지시, 목표가, 수익률 예측 같은 직접적 투자 지시는 절대 쓰지 마 (정보 제공까지만)
+
 {{
   "reels_script_a": "...",
   "reels_script_b": "...",
@@ -476,10 +503,11 @@ def ai_generate_package(topic_question, source_text, verified=True):
     {{"emoji": "🙌", "title": "...", "body": "...", "search_query": "영어검색어"}},
     {{"emoji": "💬", "title": "...", "body": "...", "search_query": "영어검색어"}}
   ],
-  "caption": "질문 1줄 + 투표/댓글 유도, 짧게"
+  "caption": "질문 1줄 + 투표/댓글 유도, 짧게",
+  "checklist": ["점검포인트1", "점검포인트2", "..."]
 }}
 """
-    return call_claude_json(prompt, max_tokens=2500)
+    return call_claude_json(prompt, max_tokens=2700)
 
 
 def search_pexels_photo(query, used_ids=None, lock=None):
@@ -523,7 +551,7 @@ def load_photo(photo_bytes):
 
 # ============ 표지: 사진 + 하단 고정 2줄 헤드라인 ============
 def make_cover(photo_bytes, line1, line2, page_label):
-    line1, line2 = strip_emoji(line1), strip_emoji(line2)
+    line1, line2 = flatten_text(strip_emoji(line1)), flatten_text(strip_emoji(line2))
     img = load_photo(photo_bytes)
     apply_gradient(img, top_alpha=110, bottom_alpha=245)
     draw = ImageDraw.Draw(img, "RGBA")
@@ -571,8 +599,8 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
 
     safe_width = W - SAFE_PAD * 2
 
-    title_text = strip_emoji(title)
-    body = strip_emoji(body)
+    title_text = flatten_text(strip_emoji(title))
+    body = flatten_text(strip_emoji(body))
     title_size = 56
     body_size = 38
     title_lines, body_lines = [], []
@@ -639,6 +667,16 @@ def send_photo_group(chat_id, images):
 
 def send_message(chat_id, text):
     requests.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": chat_id, "text": text})
+
+
+def send_checklist_message(chat_id, checklist):
+    """슬라이드5(CTA)에서 'DM으로 보내준다'고 약속한 체크리스트를 실제로 전송.
+    안내문구는 AI 출력에 의존하지 않고 코드에 고정해서 항상 붙게 함."""
+    if not checklist:
+        return
+    lines = "\n".join(f"☑️ {item}" for item in checklist)
+    disclaimer = "\n\n※ 이 자료는 정보 제공 목적이며 투자 권유가 아니에요. 투자 판단과 그에 따른 책임은 본인에게 있습니다."
+    send_message(chat_id, "📌 DM용 체크리스트\n\n" + lines + disclaimer)
 
 
 def send_buttons(chat_id, text, buttons):
@@ -712,6 +750,7 @@ def process_generation(chat_id, text):
         send_photo_group(chat_id, images)
         if s.get("caption"):
             send_message(chat_id, "📋 캡션\n\n" + s["caption"])
+        send_checklist_message(chat_id, s.get("checklist"))
     except Exception as e:
         send_message(chat_id, f"카드를 만드는 중 오류가 났어요: {e}")
     finally:
@@ -829,6 +868,7 @@ def process_package(chat_id, topic, kind="both"):
         send_photo_group(chat_id, images)
         if pkg.get("caption"):
             send_message(chat_id, "📋 캡션\n\n" + pkg["caption"])
+        send_checklist_message(chat_id, pkg.get("checklist"))
     except Exception as e:
         send_message(chat_id, f"패키지를 만드는 중 오류가 났어요: {e}")
     finally:
