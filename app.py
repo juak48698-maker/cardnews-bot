@@ -234,10 +234,11 @@ def ai_generate_5slides(source_text):
 
 [슬라이드4에서 예고한 체크리스트를 실제로 작성해줘 — 발송용 자료]
 - 슬라이드4에서는 예고만 하고 카드에는 절대 내용을 공개하지 않지만, 이 체크리스트는 실제로 발송할 자료라서 진짜로 채워야 해
-- 반드시 [참고 자료]에 있는 사실관계에서만 도출해, 참고자료에 없는 새로운 사실이나 수치는 절대 지어내지 마
-- 5~7개 항목, 각 항목은 title(점검 포인트 제목, 짧게) / why(왜 중요한지, 참고자료의 어떤 사실과 연결되는지) / how(구체적으로 무엇을, 어떻게 확인하면 되는지)로 구성
-- why와 how는 따로 라벨을 붙이지 않고 이어붙여도 하나의 자연스러운 문단처럼 읽히게 써줘 (예: "~라는 신호예요. 그러니 ~를 확인해보세요" 처럼 근거→행동 순으로 매끄럽게 연결)
-- 특정 종목 매수/매도 지시, 목표가, 수익률 예측 같은 직접적 투자 지시는 절대 쓰지 마 (정보 제공까지만)
+- 5~7개 항목, 각 항목은 title(점검 포인트 제목, 짧게) / why(왜 중요한지, 참고자료의 어떤 사실과 연결되는지) / finding(구독자 대신 네가 직접 조사한 결과)로 구성
+- [참고 자료]만으로 부족하면 반드시 web search 툴을 직접 사용해서 관련 증권사 평가·비교 지표·후속 소식 등을 실제로 검색해서 찾아낸 회사명·수치·날짜를 finding에 써. 검색해도 못 찾으면 지어내지 말고 "현재 시점에서 추가로 확인되는 자료는 없음"이라고 솔직히 써
+- finding은 절대 "확인해보세요", "살펴보세요", "점검하세요" 같은 지시문으로 끝내지 마 — 네가 직접 찾은 구체적인 사실 자체를 서술해
+- why와 finding은 따로 라벨을 붙이지 않고 이어붙여도 하나의 자연스러운 문단처럼 읽히게 써줘
+- 특정 종목 매수/매도 지시, 목표가 제시, 수익률 예측 같은 직접적 투자 지시는 절대 쓰지 마 (조사한 사실을 정보로 전달하는 것까지만)
 
 ### 출력 (아래 JSON 형식으로만, 다른 설명 붙이지 마)
 {{
@@ -250,12 +251,12 @@ def ai_generate_5slides(source_text):
   ],
   "caption": "질문 1줄 + 투표/댓글 유도, 짧게",
   "checklist": [
-    {{"title": "점검 포인트 제목", "why": "왜 중요한지 (근거자료 사실 연결)", "how": "구체적으로 어떻게 확인하는지"}}
+    {{"title": "점검 포인트 제목", "why": "왜 중요한지 (참고자료 사실 연결)", "finding": "직접 검색해서 찾아낸 실제 정보"}}
   ]
 }}
 title, body, line1, line2, caption 안에는 이모지 넣지 마 (emoji 필드에만 딱 1개씩).
 """
-    return call_claude_json(prompt, max_tokens=3200)
+    return call_claude_json_with_search(prompt, max_tokens=4500, max_uses=6)
 
 
 def youtube_top_videos(query, max_results=4):
@@ -494,7 +495,43 @@ def extract_json(text):
     return json.loads(repaired_text)
 
 
-def call_claude_json(prompt, max_tokens=1500, retries=2):
+def call_claude_with_search(prompt, max_tokens=1500, max_uses=6):
+    """call_claude와 동일하지만 web_search 툴을 붙여서, AI가 답변을 쓰기 전에 직접 검색해서
+    실제 데이터를 찾아 채우도록 함 (체크리스트에 '확인해보세요' 대신 실제 조사 결과를 넣기 위함)"""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_uses}],
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    blocks = resp.json().get("content", [])
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    return text.strip()
+
+
+def call_claude_json_with_search(prompt, max_tokens=1500, retries=3, max_uses=6):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            text = call_claude_with_search(prompt, max_tokens=max_tokens, max_uses=max_uses)
+            return extract_json(text)
+        except Exception as e:
+            last_err = e
+            continue
+    raise Exception(f"AI 응답을 이해하지 못했어요 (재시도 {retries}번 실패): {last_err}")
+
+
+def call_claude_json(prompt, max_tokens=1500, retries=3):
     """call_claude + JSON 파싱을 하나로 묶고, 실패하면 자동 재시도"""
     last_err = None
     for attempt in range(retries):
@@ -525,15 +562,16 @@ def ai_generate_package(topic_question, source_text, verified=True):
     if verified:
         fact_note = "아래는 실제로 확인된 뉴스 기사야. 여기 있는 사실관계와 수치만 사용하고, 없는 내용은 절대 지어내지 마."
         checklist_note = (
-            "checklist는 반드시 근거자료의 사실관계에서만 도출해. 각 항목 뒤에 ' — ' 다음에 "
-            "근거자료의 어떤 사실과 연결되는지 1줄로 덧붙여줘."
+            "checklist의 finding은 근거자료만으로 부족하면 반드시 web search 툴을 직접 사용해서 추가 정보를 찾아. "
+            "예: 다른 증권사들의 평가·목표가, 관련 지표, 컨센서스 형성 여부 등을 실제로 검색해서 찾아낸 회사명·수치·날짜를 써. "
+            "검색해도 못 찾으면 지어내지 말고 '현재 시점에서 추가로 확인되는 자료는 없음'이라고 솔직히 써."
         )
     else:
         fact_note = ("이 주제를 뒷받침하는 실제 기사를 찾지 못했어. 구체적인 수치·통계·날짜를 새로 지어내지 말고, "
                      "'~하는 분위기다', '~라는 우려가 나온다' 같은 방향성 위주의 조심스러운 표현만 사용해.")
         checklist_note = (
-            "실제 기사로 확인되지 않은 주제이므로, checklist는 구체적 수치 없이 "
-            "'이런 상황에서 일반적으로 점검하면 좋은 것들' 위주의 일반론적 프레임워크로만 작성해."
+            "이 주제는 실제 기사로 확인되지 않았으니, checklist의 finding도 web search 툴로 직접 검색해서 확인한 내용만 써. "
+            "검색해도 못 찾으면 구체적 수치 없이 '아직 확인된 공식 자료가 없음'이라고 정직하게 써."
         )
 
     prompt = f"""주제: {topic_question}
@@ -563,10 +601,11 @@ def ai_generate_package(topic_question, source_text, verified=True):
 
 [슬라이드4에서 예고한 체크리스트를 실제로 작성해줘 — 발송용 자료]
 - 카드에는 절대 내용을 공개하지 않지만, 이 체크리스트는 실제로 발송할 자료라서 진짜로 채워야 해
+- 5~7개 항목, 각 항목은 title(점검 포인트 제목, 짧게) / why(왜 중요한지, 근거자료의 어떤 사실과 연결되는지) / finding(구독자 대신 네가 직접 조사한 결과)로 구성
 - {checklist_note}
-- 5~7개 항목, 각 항목은 title(점검 포인트 제목, 짧게) / why(왜 중요한지, 근거자료의 어떤 사실과 연결되는지) / how(구체적으로 무엇을 어떻게 확인하면 되는지)로 구성
-- why와 how는 따로 라벨을 붙이지 않고 이어붙여도 하나의 자연스러운 문단처럼 읽히게 써줘 (예: "~라는 신호예요. 그러니 ~를 확인해보세요" 처럼 근거→행동 순으로 매끄럽게 연결)
-- 특정 종목 매수/매도 지시, 목표가, 수익률 예측 같은 직접적 투자 지시는 절대 쓰지 마 (정보 제공까지만)
+- finding은 절대 "확인해보세요", "살펴보세요", "점검하세요" 같은 지시문으로 끝내지 마 — 네가 직접 찾은 회사명, 수치, 날짜, 평가 등 구체적인 사실 자체를 서술해
+- why와 finding은 따로 라벨을 붙이지 않고 이어붙여도 하나의 자연스러운 문단처럼 읽히게 써줘
+- 특정 종목 매수/매도 지시, 목표가 제시, 수익률 예측 같은 직접적 투자 지시는 절대 쓰지 마 (조사한 사실을 정보로 전달하는 것까지만)
 
 {{
   "reels_script_a": "...",
@@ -580,11 +619,11 @@ def ai_generate_package(topic_question, source_text, verified=True):
   ],
   "caption": "질문 1줄 + 투표/댓글 유도, 짧게",
   "checklist": [
-    {{"title": "점검 포인트 제목", "why": "왜 중요한지 (근거자료 사실 연결)", "how": "구체적으로 어떻게 확인하는지"}}
+    {{"title": "점검 포인트 제목", "why": "왜 중요한지 (근거자료 사실 연결)", "finding": "직접 검색해서 찾아낸 실제 정보"}}
   ]
 }}
 """
-    return call_claude_json(prompt, max_tokens=4500)
+    return call_claude_json_with_search(prompt, max_tokens=6000, max_uses=8)
 
 
 def search_pexels_photo(query, used_ids=None, lock=None):
@@ -757,8 +796,8 @@ def send_checklist_message(chat_id, checklist):
         if isinstance(item, dict):
             title = str(item.get("title", "")).strip()
             why = str(item.get("why", "")).strip()
-            how = str(item.get("how", "")).strip()
-            body = " ".join(p for p in [why, how] if p)
+            finding = str(item.get("finding", "") or item.get("how", "")).strip()
+            body = " ".join(p for p in [why, finding] if p)
             blocks.append(f"{i}. 📍 {title}\n{body}" if body else f"{i}. 📍 {title}")
         else:
             blocks.append(f"{i}. 📍 {item}")
