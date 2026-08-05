@@ -242,6 +242,7 @@ def ai_generate_5slides(source_text):
 - 슬라이드4에서는 예고만 하고 카드에는 절대 내용을 공개하지 않지만, 이 체크리스트는 실제로 발송할 자료라서 진짜로 채워야 해
 - 5~7개 항목, 각 항목은 title(점검 포인트 제목, 짧게) / why(왜 중요한지, 참고자료의 어떤 사실과 연결되는지) / finding(구독자 대신 네가 직접 조사한 결과)로 구성
 - [참고 자료]만으로 부족하면 반드시 web search 툴을 직접 사용해서 관련 증권사 평가·비교 지표·후속 소식 등을 실제로 검색해서 찾아낸 회사명·수치·날짜를 finding에 써. 검색해도 못 찾으면 지어내지 말고 "현재 시점에서 추가로 확인되는 자료는 없음"이라고 솔직히 써
+- 검색 결과를 인용할 때 <cite>나 [1] 같은 인용 태그·각주 표시는 절대 쓰지 마, 찾아낸 사실을 자연스러운 문장으로 그대로 풀어써
 - finding은 절대 "확인해보세요", "살펴보세요", "점검하세요" 같은 지시문으로 끝내지 마 — 네가 직접 찾은 구체적인 사실 자체를 서술해
 - why와 finding은 따로 라벨을 붙이지 않고 이어붙여도 하나의 자연스러운 문단처럼 읽히게 써줘
 - 특정 종목 매수/매도 지시, 목표가 제시, 수익률 예측 같은 직접적 투자 지시는 절대 쓰지 마 (조사한 사실을 정보로 전달하는 것까지만)
@@ -387,26 +388,10 @@ def fetch_foreign_news(query):
 반드시 지켜야 할 것:
 - 게시일이 7일(168시간)을 넘었거나, 게시일을 검색 결과에서 확인할 수 없는 기사는 절대 포함하지 마
 - 검색으로 확인되지 않은 내용은 절대 지어내지 마
+- 인용할 때 <cite>나 [1] 같은 인용 태그·각주 표시는 절대 쓰지 마, 자연스러운 문장으로 풀어써
 - 조건에 맞는 기사가 없으면 {{"articles": []}}로 답해"""
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1500,
-            "messages": [{"role": "user", "content": prompt}],
-            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    blocks = resp.json().get("content", [])
-    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
     try:
+        text = call_claude_with_search(prompt, max_tokens=1500, max_uses=3)
         return extract_json(text).get("articles", [])
     except Exception:
         return []
@@ -522,6 +507,10 @@ def call_claude_with_search(prompt, max_tokens=1500, max_uses=6):
     resp.raise_for_status()
     blocks = resp.json().get("content", [])
     text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    # web_search 툴을 쓰면 모델이 <cite index="...">...</cite> 형태의 내부 인용 태그를 텍스트에
+    # 그대로 섞어 넣는 경우가 있어, 태그는 지우고 안의 텍스트만 남김
+    text = re.sub(r"<cite[^>]*>(.*?)</cite>", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"</?cite[^>]*>", "", text)
     return text.strip()
 
 
@@ -565,19 +554,20 @@ def ai_generate_topics(raw_data):
 
 
 def ai_generate_package(topic_question, source_text, verified=True):
+    cite_note = "검색 결과를 인용할 때 <cite>나 [1] 같은 인용 태그·각주 표시는 절대 쓰지 마, 찾아낸 사실을 자연스러운 문장으로 그대로 풀어써."
     if verified:
         fact_note = "아래는 실제로 확인된 뉴스 기사야. 여기 있는 사실관계와 수치만 사용하고, 없는 내용은 절대 지어내지 마."
         checklist_note = (
             "checklist의 finding은 근거자료만으로 부족하면 반드시 web search 툴을 직접 사용해서 추가 정보를 찾아. "
             "예: 다른 증권사들의 평가·목표가, 관련 지표, 컨센서스 형성 여부 등을 실제로 검색해서 찾아낸 회사명·수치·날짜를 써. "
-            "검색해도 못 찾으면 지어내지 말고 '현재 시점에서 추가로 확인되는 자료는 없음'이라고 솔직히 써."
+            f"검색해도 못 찾으면 지어내지 말고 '현재 시점에서 추가로 확인되는 자료는 없음'이라고 솔직히 써. {cite_note}"
         )
     else:
         fact_note = ("이 주제를 뒷받침하는 실제 기사를 찾지 못했어. 구체적인 수치·통계·날짜를 새로 지어내지 말고, "
                      "'~하는 분위기다', '~라는 우려가 나온다' 같은 방향성 위주의 조심스러운 표현만 사용해.")
         checklist_note = (
             "이 주제는 실제 기사로 확인되지 않았으니, checklist의 finding도 web search 툴로 직접 검색해서 확인한 내용만 써. "
-            "검색해도 못 찾으면 구체적 수치 없이 '아직 확인된 공식 자료가 없음'이라고 정직하게 써."
+            f"검색해도 못 찾으면 구체적 수치 없이 '아직 확인된 공식 자료가 없음'이라고 정직하게 써. {cite_note}"
         )
 
     prompt = f"""주제: {topic_question}
