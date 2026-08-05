@@ -16,8 +16,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+NAVER_CLIENT_ID = os.environ.get("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET", "")
 
-SEED_KEYWORDS = ["주식", "미국주식", "금리", "환율", "반도체", "비트코인", "부동산", "코스피"]
+# "/추천" 후보 뉴스를 수집할 때 쓰는 키워드. 국내:해외 = 대략 1:3 비율로 뽑아서
+# 최종 후보 기사 비중이 국내3 : 해외7에 가까워지도록 함 (해외는 기사당 최대 3개까지 나오기 때문)
+DOMESTIC_KEYWORDS = ["코스피", "국내증시", "반도체", "부동산"]
+FOREIGN_KEYWORDS = ["미국주식", "나스닥", "S&P500", "연준", "빅테크실적", "엔비디아", "환율"]
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
@@ -36,8 +41,9 @@ PENDING_PHOTOS = {}
 ACTIVE_JOBS = {}  # chat_id -> {"cancelled": bool}
 PROCESSED_UPDATE_IDS = deque(maxlen=2000)  # 텔레그램 재전송(같은 update_id) 중복 처리 방지
 PHOTO_LOCK = threading.Lock()  # used_photo_ids 동시접근 보호 (병렬 사진검색용)
-PENDING_TOPICS = {}  # chat_id -> ["/추천"으로 나온 주제 리스트]
-SELECTED_TOPIC = {}  # chat_id -> 버튼으로 고른 주제 (콘텐츠 종류 선택 전까지 임시 보관)
+PENDING_TOPICS = {}  # chat_id -> [{"question":..., "article_ids":[...]}, ...] ("/추천" 결과)
+CANDIDATES_BY_CHAT = {}  # chat_id -> {article_id: {"title","summary","link","source_type"}}
+SELECTED_TOPIC = {}  # chat_id -> {"question":..., "source_text":...} (콘텐츠 종류 선택 전까지 임시 보관)
 
 
 def font(path, size):
@@ -263,7 +269,7 @@ def youtube_top_videos(query, max_results=4):
 
 
 def google_trends_rising(keyword):
-    """해당 키워드와 관련해서 요즘 급상승 중인 연관 검색어"""
+    """해당 키워드와 관련해서 요즘 급상승 중인 연관 검색어 (참고용 신호일 뿐, 카드뉴스 팩트 근거로는 안 씀)"""
     try:
         from pytrends.request import TrendReq
         pytrends = TrendReq(hl="ko-KR", tz=540)
@@ -277,25 +283,98 @@ def google_trends_rising(keyword):
         return []
 
 
-def collect_trend_data():
-    """시드 키워드 중 일부를 뽑아 유튜브+구글트렌드 데이터를 텍스트로 모으고, 참고링크 목록도 같이 반환"""
+# ============ 뉴스기사 수집 (팩트 근거) ============
+def fetch_naver_news(query, display=4):
+    """네이버 뉴스 검색 API로 실제 국내 기사 목록(제목/요약/링크)을 가져옴 (무료)"""
+    r = requests.get(
+        "https://openapi.naver.com/v1/search/news.json",
+        headers={
+            "X-Naver-Client-Id": NAVER_CLIENT_ID,
+            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        },
+        params={"query": query, "display": display, "sort": "date"},
+        timeout=12,
+    )
+    r.raise_for_status()
+    tag_re = re.compile(r"<.*?>")
+    out = []
+    for it in r.json().get("items", []):
+        link = it.get("originallink") or it.get("link")
+        if not link:
+            continue
+        out.append({
+            "title": tag_re.sub("", it.get("title", "")),
+            "summary": tag_re.sub("", it.get("description", "")),
+            "link": link,
+        })
+    return out
+
+
+def fetch_foreign_news(query):
+    """Claude의 web search로 해외 증시 관련 실제 외신 기사를 찾아 한국어로 요약 (검색당 $0.01 + 토큰비용)"""
+    prompt = f""""{query}" 관련 최근 1~2일 내 해외 증권/경제 뉴스(블룸버그, CNBC, 로이터, WSJ 등)를 웹검색으로 찾아서,
+실제로 검색 결과에서 확인한 기사 최대 3개를 아래 JSON으로만 답해, 다른 설명은 붙이지 마.
+
+{{"articles": [{{"title": "기사 제목(한국어로 번역)", "summary": "핵심 팩트 2~3문장, 수치는 원문 그대로 유지", "link": "실제 기사 URL"}}]}}
+
+검색으로 확인되지 않은 내용은 절대 지어내지 마. 검색 결과가 없으면 {{"articles": []}}로 답해."""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    blocks = resp.json().get("content", [])
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    try:
+        return extract_json(text).get("articles", [])
+    except Exception:
+        return []
+
+
+def collect_news_candidates():
+    """국내(네이버, 무료) + 해외(Claude 웹서치, 유료소액) 실제 기사 후보를 모음.
+    해외 키워드를 국내보다 3배 더 뽑아서, 최종 후보 기사 비중이 대략 해외7:국내3에 가깝도록 함."""
     import random
-    import urllib.parse
-    picks = random.sample(SEED_KEYWORDS, k=min(4, len(SEED_KEYWORDS)))
-    lines = []
-    references = []  # [(라벨, url), ...]
-    for kw in picks:
+    domestic_picks = random.sample(DOMESTIC_KEYWORDS, k=min(1, len(DOMESTIC_KEYWORDS)))
+    foreign_picks = random.sample(FOREIGN_KEYWORDS, k=min(3, len(FOREIGN_KEYWORDS)))
+
+    candidates = []  # [{"id","title","summary","link","source_type"}]
+    references = []  # [(라벨, url), ...] — 텔레그램으로 사용자에게만 보여줄 출처
+
+    for kw in domestic_picks:
         try:
-            for v in youtube_top_videos(kw, max_results=4):
-                lines.append(f"[유튜브 인기/{kw}] {v['title']} (조회수 {v['views']:,})")
-                references.append((f"▶ {v['title']} (조회수 {v['views']:,})", v["url"]))
+            for a in fetch_naver_news(kw):
+                cid = f"d{len(candidates)}"
+                candidates.append({"id": cid, "title": a["title"], "summary": a["summary"],
+                                    "link": a["link"], "source_type": "국내"})
+                references.append((f"📰 [국내] {a['title']}", a["link"]))
         except Exception:
             pass
-        for q in google_trends_rising(kw):
-            lines.append(f"[구글트렌드 급상승/{kw}] {q}")
-            trend_url = "https://trends.google.co.kr/trends/explore?geo=KR&q=" + urllib.parse.quote(q)
-            references.append((f"📈 '{q}' 검색 트렌드", trend_url))
-    return "\n".join(lines), references
+
+    for kw in foreign_picks:
+        try:
+            for a in fetch_foreign_news(kw):
+                if not a.get("link"):
+                    continue
+                cid = f"f{len(candidates)}"
+                candidates.append({"id": cid, "title": a["title"], "summary": a["summary"],
+                                    "link": a["link"], "source_type": "해외"})
+                references.append((f"🌐 [해외] {a['title']}", a["link"]))
+        except Exception:
+            pass
+
+    return candidates, references
 
 
 def call_claude(prompt, max_tokens=1500):
@@ -342,24 +421,35 @@ def call_claude_json(prompt, max_tokens=1500, retries=2):
     raise Exception(f"AI 응답을 이해하지 못했어요 (재시도 {retries}번 실패): {last_err}")
 
 
-def ai_generate_topics(raw_data):
-    prompt = f"""다음은 최근 금융/투자 관련 유튜브 인기 영상 제목(조회수 포함)과 구글 트렌드 급상승 연관검색어야.
+def ai_generate_topics_from_news(candidates):
+    """실제 수집된 뉴스기사 후보들 "안에서만" 카드뉴스 소재로 적합한 8개를 골라줌 (근거기사 id도 같이 반환)"""
+    listing = "\n".join(
+        f"[{c['id']}] ({c['source_type']}) {c['title']} - {c['summary']}" for c in candidates
+    )
+    prompt = f"""다음은 실제로 확인된 최근 금융/투자 뉴스 기사 목록이야 (각 항목 앞 [id]는 나중에 참조용).
 
-{raw_data if raw_data.strip() else "(데이터 없음, 최근 시장 상황을 참고해서 일반적으로 관심 높은 주제로 대신 뽑아줘)"}
+{listing if listing.strip() else "(수집된 기사 없음)"}
 
-이 데이터를 참고해서, 시청자들이 실제로 궁금해할만한 콘텐츠 주제를 8개 뽑아줘.
-각 주제는 짧고 흥미로운 질문 형태로.
-**중요: 근거가 된 영상의 조회수가 높거나, 여러 데이터에서 반복적으로 나타나는 주제일수록 인기도가 높은 것으로 보고, 1번에 가장 인기도 높은 주제, 8번에 가장 낮은 주제가 오도록 인기도 순으로 정렬해줘.**
+반드시 위 기사 목록에 있는 내용만 근거로 삼아서, 시청자들이 궁금해할만한 콘텐츠 주제를 8개 뽑아줘.
+- 목록에 없는 내용은 절대 지어내지 마
+- 각 주제는 짧고 흥미로운 질문 형태로
+- 전체 8개 중 해외기사 근거 주제가 대략 7, 국내기사 근거 주제가 대략 3이 되도록 배분해줘 (기사 개수가 부족하면 있는 만큼만)
+- 화제성(파급력, 구체적 수치 변화 여부, 속보성) 높은 순으로 1번부터 정렬
+
 아래 JSON 형식으로만 답해, 다른 설명 붙이지 마:
-{{"topics": ["주제/질문 1", "주제/질문 2", "..."]}}
+{{"topics": [{{"question": "주제/질문", "article_ids": ["근거가 된 기사 id 1~2개"]}}]}}
 """
-    return call_claude_json(prompt, max_tokens=1200)["topics"]
+    return call_claude_json(prompt, max_tokens=1500)["topics"]
 
 
-def ai_generate_package(topic):
-    prompt = f"""주제: {topic}
+def ai_generate_package(topic_question, source_text):
+    """실제 근거기사(source_text) 안의 사실관계만 사용해서 릴스대본+5슬라이드 카드뉴스를 만듦"""
+    prompt = f"""주제: {topic_question}
 
-이 주제로 콘텐츠 패키지를 만들어줘. 아래 JSON 형식으로만 답해, 다른 설명 붙이지 마.
+[실제 뉴스 근거자료 — 아래 사실관계와 수치만 사용할 것. 여기 없는 내용은 절대 지어내지 마]
+{source_text}
+
+이 근거자료를 바탕으로 콘텐츠 패키지를 만들어줘. 아래 JSON 형식으로만 답해, 다른 설명 붙이지 마.
 이모지는 각 지정된 필드에만 넣고, 그 외 텍스트(제목/본문/대본)에는 절대 넣지 마.
 
 릴스 대본 2가지:
@@ -367,9 +457,9 @@ def ai_generate_package(topic):
 - reels_script_b: 30초 분량, 버전A와 다른 각도/톤으로 (예: 하나는 정보전달형, 하나는 스토리텔링형)
 
 카드뉴스는 "5슬라이드 공식"을 반드시 따라서 고정 5장으로 만들어줘 (표지1 + 본문4):
-- cover(슬라이드1/후킹): 숫자 포함 자극적 헤드라인 두 줄, 위기감 도는 배경톤
-- slides[0](슬라이드2/팩트): 핵심 수치 **볼드** 포함한 팩트 제시
-- slides[1](슬라이드3/반전): 모순되는 두 정보 대비 + 불안 증폭 마무리
+- cover(슬라이드1/후킹): 숫자 포함 자극적 헤드라인 두 줄, 위기감 도는 배경톤. 반드시 근거자료에 있는 실제 수치만 사용
+- slides[0](슬라이드2/팩트): 핵심 수치 **볼드** 포함한 팩트 제시 (근거자료 그대로)
+- slides[1](슬라이드3/반전): 근거자료 안에서 모순되는 두 정보 대비 + 불안 증폭 마무리
 - slides[2](슬라이드4/예고): "무엇을 점검해야 할까요?" 톤, 체크리스트 있다는 예고만 하고 내용은 절대 공개 금지
 - slides[3](슬라이드5/CTA): 팔로우+댓글 유도, DM으로 자료 보내준다는 문구
 문장은 짧고 단정적으로, 각 슬라이드는 다음 장이 궁금해지는 여운으로 마무리.
@@ -442,8 +532,9 @@ def make_cover(photo_bytes, line1, line2, page_label):
     size = 80
     l1_lines = wrap_text(draw, line1, font(F_TITLE, size), safe_width)
     l2_lines = wrap_text(draw, line2, font(F_TITLE, size), safe_width)
-    while (len(l1_lines) + len(l2_lines)) > 4 and size > 40:
-        size -= 6
+    # line1, line2 합쳐서 화면에 항상 2줄까지만 나오도록 폰트 크기를 계속 축소
+    while (len(l1_lines) + len(l2_lines)) > 2 and size > 34:
+        size -= 4
         l1_lines = wrap_text(draw, line1, font(F_TITLE, size), safe_width)
         l2_lines = wrap_text(draw, line2, font(F_TITLE, size), safe_width)
 
@@ -629,19 +720,29 @@ def process_recommend(chat_id):
     job = {"cancelled": False}
     ACTIVE_JOBS[chat_id] = job
     try:
-        send_message(chat_id, "요즘 뜨는 금융/투자 주제를 훑어보는 중이에요, 잠시만요...")
-        raw, references = collect_trend_data()
+        send_message(chat_id, "실제 뉴스기사를 확인하는 중이에요, 잠시만요... (해외기사 검색 포함이라 조금 걸릴 수 있어요)")
+        candidates, references = collect_news_candidates()
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
-        topics = ai_generate_topics(raw)
+
+        if not candidates:
+            send_message(chat_id, "지금은 관련 기사를 찾지 못했어요. 잠시 후 다시 시도해주세요.")
+            return
+
+        topics = ai_generate_topics_from_news(candidates)
         PENDING_TOPICS[chat_id] = topics
-        buttons = [(f"{i+1}. {t[:55]}{'...' if len(t) > 55 else ''}", f"topic:{i}") for i, t in enumerate(topics)]
-        send_buttons(chat_id, "요즘 관심 높은 주제들이에요 (인기도 높은 순). 버튼을 눌러 골라주세요 👇", buttons)
+        CANDIDATES_BY_CHAT[chat_id] = {c["id"]: c for c in candidates}
+
+        buttons = [
+            (f"{i+1}. {t['question'][:55]}{'...' if len(t['question']) > 55 else ''}", f"topic:{i}")
+            for i, t in enumerate(topics)
+        ]
+        send_buttons(chat_id, "실제 뉴스 기반으로 뽑은 주제들이에요 (화제성 높은 순). 버튼을 눌러 골라주세요 👇", buttons)
 
         if references:
             ref_lines = [f"{label}\n{url}" for label, url in references[:15]]
-            send_message(chat_id, "🔗 참고한 인기 영상·트렌드 링크\n\n" + "\n\n".join(ref_lines))
+            send_message(chat_id, "🔗 참고한 기사 출처\n\n" + "\n\n".join(ref_lines))
     except Exception as e:
         send_message(chat_id, f"주제를 찾는 중 오류가 났어요: {e}")
     finally:
@@ -649,12 +750,13 @@ def process_recommend(chat_id):
 
 
 def process_package(chat_id, topic, kind="both"):
+    """topic: {"question": str, "source_text": str}"""
     job = {"cancelled": False}
     ACTIVE_JOBS[chat_id] = job
     try:
         label = {"reels": "릴스 대본", "cards": "카드뉴스", "both": "대본+카드뉴스"}.get(kind, "콘텐츠")
-        send_message(chat_id, f"'{topic}' 주제로 {label} 만드는 중이에요...")
-        pkg = ai_generate_package(topic)
+        send_message(chat_id, f"'{topic['question']}' 주제로 {label} 만드는 중이에요...")
+        pkg = ai_generate_package(topic["question"], topic["source_text"])
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
@@ -730,9 +832,14 @@ def webhook():
             idx = int(cb_data.split(":", 1)[1])
             topics = PENDING_TOPICS.get(cb_chat_id, [])
             if 0 <= idx < len(topics):
-                topic = topics[idx]
-                SELECTED_TOPIC[cb_chat_id] = topic
-                send_buttons(cb_chat_id, f"'{topic}'\n\n뭘 만들어드릴까요?", [
+                t = topics[idx]
+                cand_map = CANDIDATES_BY_CHAT.get(cb_chat_id, {})
+                source_articles = [cand_map[aid] for aid in t.get("article_ids", []) if aid in cand_map]
+                source_text = "\n\n".join(
+                    f"[{a['source_type']}] {a['title']}\n{a['summary']}" for a in source_articles
+                ) or t["question"]
+                SELECTED_TOPIC[cb_chat_id] = {"question": t["question"], "source_text": source_text}
+                send_buttons(cb_chat_id, f"'{t['question']}'\n\n뭘 만들어드릴까요?", [
                     ("📝 릴스 대본만", "type:reels"),
                     ("🖼️ 카드뉴스만", "type:cards"),
                     ("🎬 둘 다", "type:both"),
@@ -778,7 +885,7 @@ def webhook():
             "카드마다 어울리는 사진과 함께 만들어드릴게요.\n\n"
             "표지 사진을 직접 고르고 싶으면, 사진 먼저 보내고 원문을 이어서 보내주세요.\n"
             "만드는 중에 멈추고 싶으면 '취소'라고 보내주세요.\n\n"
-            "키워드 없이 요즘 뜨는 주제를 추천받고 싶으면 '/추천'이라고 보내주세요."
+            "키워드 없이 실제 뉴스기사 기반으로 요즘 뜨는 주제를 추천받고 싶으면 '/추천'이라고 보내주세요."
         ))
         return "ok"
 
