@@ -257,9 +257,9 @@ title, body, line1, line2, caption 안에는 이모지 넣지 마 (emoji 필드�
 
 
 def youtube_top_videos(query, max_results=4):
-    """최근 7일 내 업로드된 영상 중 조회수 높은 순으로 가져옴"""
+    """최근 48시간 내 업로드된 영상 중 조회수 높은 순으로 가져옴"""
     import datetime
-    published_after = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    published_after = (datetime.datetime.utcnow() - datetime.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get("https://www.googleapis.com/youtube/v3/search", params={
         "part": "snippet", "q": query, "type": "video", "order": "viewCount",
         "publishedAfter": published_after, "maxResults": max_results,
@@ -284,11 +284,16 @@ def youtube_top_videos(query, max_results=4):
 
 
 def google_trends_rising(keyword):
-    """해당 키워드와 관련해서 요즘 급상승 중인 연관 검색어"""
+    """해당 키워드와 관련해서 최근 48시간 내 급상승 중인 연관 검색어"""
     try:
+        import datetime
         from pytrends.request import TrendReq
         pytrends = TrendReq(hl="ko-KR", tz=540)
-        pytrends.build_payload([keyword], timeframe="now 7-d", geo="KR")
+        now = datetime.datetime.utcnow()
+        start = now - datetime.timedelta(hours=48)
+        # pytrends는 "now 7-d" 같은 프리셋 외에, 시간 단위 커스텀 범위("YYYY-MM-DDTHH YYYY-MM-DDTHH")도 지원함
+        timeframe = f"{start.strftime('%Y-%m-%dT%H')} {now.strftime('%Y-%m-%dT%H')}"
+        pytrends.build_payload([keyword], timeframe=timeframe, geo="KR")
         related = pytrends.related_queries()
         rising = related.get(keyword, {}).get("rising")
         if rising is None or rising.empty:
@@ -321,40 +326,59 @@ def collect_trend_data():
 
 
 # ============ 뉴스기사 팩트체크 (선택된 주제 1개에 대해서만 실행) ============
-def fetch_naver_news(query, display=3):
-    """네이버 뉴스 검색 API로 실제 국내 기사 목록(제목/요약/링크)을 가져옴 (무료)"""
+def fetch_naver_news(query, display=3, max_age_hours=48):
+    """네이버 뉴스 검색 API로 실제 국내 기사 목록(제목/요약/링크)을 가져옴 (무료)
+    게시된 지 max_age_hours(기본 48시간)가 지난 기사는 제외함"""
+    import datetime
+    from email.utils import parsedate_to_datetime
+    api_count = max(display * 3, 10)  # 48시간 필터링으로 많이 걸러질 수 있어 넉넉히 가져옴
     r = requests.get(
         "https://openapi.naver.com/v1/search/news.json",
         headers={
             "X-Naver-Client-Id": NAVER_CLIENT_ID,
             "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
         },
-        params={"query": query, "display": display, "sort": "date"},
+        params={"query": query, "display": api_count, "sort": "date"},
         timeout=12,
     )
     r.raise_for_status()
     tag_re = re.compile(r"<.*?>")
+    now = datetime.datetime.now(datetime.timezone.utc)
     out = []
     for it in r.json().get("items", []):
         link = it.get("originallink") or it.get("link")
         if not link:
             continue
+        try:
+            pub_dt = parsedate_to_datetime(it.get("pubDate", ""))
+            if pub_dt.tzinfo is None:
+                pub_dt = pub_dt.replace(tzinfo=datetime.timezone.utc)
+            age_hours = (now - pub_dt).total_seconds() / 3600
+            if age_hours > max_age_hours:
+                continue
+        except Exception:
+            continue  # 게시일을 확인할 수 없으면 안전하게 제외
         out.append({
             "title": tag_re.sub("", it.get("title", "")),
             "summary": tag_re.sub("", it.get("description", "")),
             "link": link,
         })
+        if len(out) >= display:
+            break
     return out
 
 
 def fetch_foreign_news(query):
     """Claude의 web search로 해외 증권/경제 관련 실제 외신 기사를 찾아 한국어로 요약 (검색당 $0.01 + 토큰비용)"""
-    prompt = f""""{query}" 관련 최근 며칠 내 해외 증권/경제 뉴스(블룸버그, CNBC, 로이터, WSJ 등)를 웹검색으로 찾아서,
+    prompt = f""""{query}" 관련 지금으로부터 48시간 이내에 게시된 해외 증권/경제 뉴스(블룸버그, CNBC, 로이터, WSJ 등)를 웹검색으로 찾아서,
 실제로 검색 결과에서 확인한 기사 최대 3개를 아래 JSON으로만 답해, 다른 설명은 붙이지 마.
 
 {{"articles": [{{"title": "기사 제목(한국어로 번역)", "summary": "핵심 팩트 2~3문장, 수치는 원문 그대로 유지", "link": "실제 기사 URL"}}]}}
 
-검색으로 확인되지 않은 내용은 절대 지어내지 마. 검색 결과가 없으면 {{"articles": []}}로 답해."""
+반드시 지켜야 할 것:
+- 게시일이 48시간을 넘었거나, 게시일을 검색 결과에서 확인할 수 없는 기사는 절대 포함하지 마
+- 검색으로 확인되지 않은 내용은 절대 지어내지 마
+- 조건에 맞는 기사가 없으면 {{"articles": []}}로 답해"""
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -380,7 +404,7 @@ def fetch_foreign_news(query):
 
 
 def fact_check_topic(topic_question):
-    """사용자가 고른 주제 1개에 대해서만 실제 뉴스기사로 사실관계를 확인
+    """사용자가 고른 주제 1개에 대해서만 실제 뉴스기사로 사실관계를 확인 (게시된 지 48시간 이내인 기사만)
     (국내: 네이버 무료 검색 / 해외: Claude 웹서치 유료소액 검색, 둘 다 시도)"""
     articles = []
     try:
@@ -679,13 +703,23 @@ def send_message(chat_id, text):
 
 
 def send_checklist_message(chat_id, checklist):
-    """슬라이드5(CTA)에서 'DM으로 보내준다'고 약속한 체크리스트를 실제로 전송.
+    """슬라이드5(CTA)에서 예고한 체크리스트를 실제로 전송.
+    title/why/how 구조는 유지하되, 라벨 없이 하나의 자연스러운 문단으로 이어붙여서 가독성을 높임.
     안내문구는 AI 출력에 의존하지 않고 코드에 고정해서 항상 붙게 함."""
     if not checklist:
         return
-    lines = "\n".join(f"☑️ {item}" for item in checklist)
+    blocks = []
+    for i, item in enumerate(checklist, 1):
+        if isinstance(item, dict):
+            title = str(item.get("title", "")).strip()
+            why = str(item.get("why", "")).strip()
+            how = str(item.get("how", "")).strip()
+            body = " ".join(p for p in [why, how] if p)
+            blocks.append(f"{i}. 📍 {title}\n{body}" if body else f"{i}. 📍 {title}")
+        else:
+            blocks.append(f"{i}. 📍 {item}")
     disclaimer = "\n\n※ 이 자료는 정보 제공 목적이며 투자 권유가 아니에요. 투자 판단과 그에 따른 책임은 본인에게 있습니다."
-    send_message(chat_id, "📌 DM용 체크리스트\n\n" + lines + disclaimer)
+    send_message(chat_id, "📌 발송용 체크리스트\n\n" + "\n\n".join(blocks) + disclaimer)
 
 
 def send_buttons(chat_id, text, buttons):
