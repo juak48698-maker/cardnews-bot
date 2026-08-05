@@ -86,6 +86,11 @@ def flatten_text(text):
     return re.sub(r"\s+", " ", (text or "").replace("\n", " ").replace("\r", " ")).strip()
 
 
+def strip_markdown_bold(text):
+    """표지(cover)는 볼드 렌더링을 지원하지 않는데 AI가 본문 습관대로 **를 넣는 경우가 있어, 안전하게 별표만 제거"""
+    return (text or "").replace("**", "")
+
+
 def apply_gradient(img, top_alpha, bottom_alpha):
     """이미지 전체에 위→아래로 어두워지는 그라데이션(오버레이) 적용"""
     draw = ImageDraw.Draw(img, "RGBA")
@@ -203,6 +208,7 @@ def ai_generate_5slides(source_text):
 
 [슬라이드 1] 후킹 (표지)
 - 두 줄 모두 최대 7어절 이내, 초등학생도 이해할 쉬운 단어만 사용 (전문용어·복문 절대 금지 — "지정학적", "펀더멘털" 같은 단어는 본문에서만 써도 됨)
+- line1, line2에는 **볼드** 마크업(별표)을 절대 쓰지 마 — 표지는 볼드 렌더링을 지원하지 않아서 별표가 글자 그대로 화면에 보임. 강조하고 싶은 숫자는 그냥 텍스트로만 써
 - 완전한 문장일 필요 없음. 짧고 임팩트 있는 구(句) 형태 허용
 - 숫자는 반드시 포함하되 단순하게 (예: "17%대 폭락"보다 "-17%")
 - 패턴: 1줄=사실/숫자 툭 던지기, 2줄=반전 또는 질문으로 궁금증 유발
@@ -596,14 +602,14 @@ def ai_generate_package(topic_question, source_text, verified=True):
 ④ 핵심 논리 연결: "그래서 결국 가장 중요한 건 ○○이다" 식으로 배경을 핵심 요인 하나로 좁혀줘 (예: AI→메모리, 금리 인하→유동성)
 ⑤ 핵심 대상 공개: 여기서 처음으로 기업/ETF/산업/정책/지역 등 구체적 대상을 공개. 절대 너무 초반에 공개하지 마
 ⑥ 신뢰 확보: 숫자·시장점유율·매출·수주잔고·성장률·"세계 1위"·"국내 유일"·공식자료·기관 발표·실제 사례 중 최소 1개 이상 반드시 포함 (근거자료의 실제 수치 사용, 지어내지 마)
-⑦ CTA: "제가 아주 쉽게 정리해놨습니다" 톤으로, 팔로우 유도 + 댓글에 이모지/키워드 남기라는 유도로 자연스럽게 마무리 (emoji 필드와 통일된 이모지 언급)
+⑦ CTA: "제가 아주 쉽게 정리해놨습니다" 톤으로 결과를 예고한 다음, 반드시 "팔로우 후 댓글에 이모티콘을 남겨주시면" 패턴으로 마무리해줘 (카드뉴스 CTA·체크리스트 유도 문구와 표현을 통일하는 거야). "아래 댓글 남겨주세요" 같은 밋밋한 표현 대신 정확히 이 패턴을 써
 
 작성 규칙: 정보량보다 궁금증 유지 우선 / 기업명·결론 너무 빨리 공개 금지 / 문장은 매우 짧게, 한 줄 10~15자 내외 권장 / 자막처럼 줄바꿈 자주(\n) / 어려운 용어는 쉽게 풀어쓰기 / 35~45초 분량 / 친근하지만 신뢰감 있는 말투 / 불필요한 수식어 제거 / 모든 문장이 다음 문장을 궁금하게 만들도록 스토리처럼 연결 (단순 나열 금지)
 
 - reels_script_a와 reels_script_b는 위 구조는 동일하게 따르되, 후킹 각도나 배경 설명 소재를 다르게 해서 톤을 다르게 가줘 (예: 하나는 손실 회피형 후킹, 하나는 기회 포착형 후킹)
 
 카드뉴스는 "5슬라이드 공식"을 반드시 따라서 고정 5장으로 만들어줘 (표지1 + 본문4):
-- cover(슬라이드1/후킹): 두 줄 모두 최대 7어절 이내, 초등학생도 이해할 쉬운 단어만 사용 (전문용어·복문 절대 금지). 완전한 문장 아니어도 됨, 임팩트 있는 구(句) 형태 허용. 숫자는 단순하게 포함 (예: "-17%"). 1줄=사실/숫자, 2줄=반전 또는 질문으로 궁금증 유발. 위기감 도는 배경톤
+- cover(슬라이드1/후킹): 두 줄 모두 최대 7어절 이내, 초등학생도 이해할 쉬운 단어만 사용 (전문용어·복문 절대 금지). 완전한 문장 아니어도 됨, 임팩트 있는 구(句) 형태 허용. 숫자는 단순하게 포함 (예: "-17%"). 1줄=사실/숫자, 2줄=반전 또는 질문으로 궁금증 유발. 위기감 도는 배경톤. line1, line2에는 **볼드** 마크업(별표)을 절대 쓰지 마 — 표지는 볼드 렌더링을 지원하지 않아서 별표가 글자 그대로 화면에 보임
   예) 1줄 "하루 만에 -6%" / 2줄 "근데 다들 웃었다?"
 - slides[0](슬라이드2/팩트): 핵심 수치 **볼드** 포함한 팩트 제시
 - slides[1](슬라이드3/반전): 모순되는 두 정보 대비 + 불안 증폭 마무리
@@ -679,7 +685,7 @@ def load_photo(photo_bytes):
 
 # ============ 표지: 사진 + 하단 고정 2줄 헤드라인 ============
 def make_cover(photo_bytes, line1, line2, page_label):
-    line1, line2 = flatten_text(strip_emoji(line1)), flatten_text(strip_emoji(line2))
+    line1, line2 = flatten_text(strip_markdown_bold(strip_emoji(line1))), flatten_text(strip_markdown_bold(strip_emoji(line2)))
     img = load_photo(photo_bytes)
     apply_gradient(img, top_alpha=110, bottom_alpha=245)
     draw = ImageDraw.Draw(img, "RGBA")
@@ -727,7 +733,7 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
 
     safe_width = W - SAFE_PAD * 2
 
-    title_text = flatten_text(strip_emoji(title))
+    title_text = flatten_text(strip_markdown_bold(strip_emoji(title)))
     body = flatten_text(strip_emoji(body))
     title_size = 56
     body_size = 38
