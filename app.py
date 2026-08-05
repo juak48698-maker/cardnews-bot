@@ -181,48 +181,57 @@ def draw_centered_mixed_line(draw, y, line, size, base_color):
 
 
 # ============ AI로 원문 → 카드 구조 변환 ============
-def ai_structure_content(raw_text):
-    prompt = f"""다음 뉴스 원문을 인스타그램 카드뉴스로 재구성해줘.
-아래 JSON 형식으로만 답해. 다른 설명이나 문장은 절대 붙이지 마.
+def ai_generate_5slides(source_text):
+    """5슬라이드 공식(후킹→팩트→반전→예고→CTA)을 고정 구조로 카드+캡션 생성"""
+    prompt = f"""너는 인스타그램 금융/재테크 카드뉴스 전문 카피라이터야.
+아래 "5슬라이드 공식"을 정확히 따라서 카드뉴스와 캡션을 작성해줘.
+이 공식은 공포/반전/궁금증 유발 구조로, 인게이지먼트(댓글·팔로우 전환)를 극대화하는 데 최적화되어 있어.
 
+[참고 자료]
+{source_text}
+
+### 구조 규칙 (반드시 5장 고정, 순서도 이대로)
+
+[슬라이드 1] 후킹 (표지)
+- 숫자가 포함된 자극적 헤드라인, 두 줄로 나눠서 (예: 1번째 줄 "이틀 만에", 2번째 줄 "-17% 돌파")
+- 둘째 줄은 질문형 느낌으로 끝나도 좋음 (예: "지금 팔아야 할까?")
+- 배경은 위기감 도는 톤(어두운 톤, 하락/긴장 이미지)
+
+[슬라이드 2] 팩트/증거 제시
+- 실제 데이터/뉴스 헤드라인 톤 문구 + 위기를 뒷받침하는 2차 팩트 한 줄
+- 핵심 수치는 반드시 **볼드**로 감싸기
+
+[슬라이드 3] 반전/의문 제기
+- "핵심 질문은 사실 '~인가' 하는 거예요" 톤으로 진짜 쟁점 제시
+- 모순되는 두 정보를 대비시키기 (예: "역대급 실적인데 왜 주가는 폭락했나?")
+- 불안을 증폭시키는 문장으로 마무리
+
+[슬라이드 4] 해결책 예고 — 절대 답을 주지 말 것
+- "그럼 지금, 가장 먼저 무엇을 점검해야 할까요?" 톤의 질문형
+- 체크리스트/포인트가 있다는 것만 예고하고, 구체적인 내용은 절대 공개하지 마
+
+[슬라이드 5] CTA
+- "게시글의 추가 내용이 궁금하다면?" 톤
+- 팔로우 + 댓글(특정 이모지) 유도, 하면 DM으로 자료(체크리스트/정리본) 보내준다고 명시
+
+### 톤 규칙
+- 문장은 짧고 단정적으로 (설명체 X, 선언체 O)
+- 각 슬라이드는 다음 장이 궁금해지는 여운으로 마무리
+
+### 출력 (아래 JSON 형식으로만, 다른 설명 붙이지 마)
 {{
-  "thumbnail_line1": "표지 첫 줄 (짧게, 예: '워런 버핏이')",
-  "thumbnail_line2": "표지 둘째 줄, 강조되는 핵심 문구 (예: '마지막으로 선택한 주식')",
-  "search_query": "표지 배경 스톡사진 검색용 영어 키워드 2~4단어",
-  "cards": [
-    {{
-      "emoji": "이 카드 내용을 대표하는 심플한 이모지 딱 1개 (국기·합성 이모지 말고 기본 이모지로)",
-      "title": "카드 제목 (짧고 명확하게, 이모지 넣지 말 것)",
-      "body": "문단형 본문 2~4문장. 그중 가장 중요한 구절 하나는 **이렇게** 별표 두 개로 감싸서 강조 표시해줘.",
-      "search_query": "이 카드 내용과 어울리는 배경 스톡사진 영어 검색어 2~4단어"
-    }}
-  ]
+  "cover": {{"line1": "슬라이드1 첫 줄", "line2": "슬라이드1 둘째 줄(강조)", "search_query": "위기감 도는 배경사진 영어검색어 2~4단어"}},
+  "slides": [
+    {{"emoji": "이모지1개", "title": "슬라이드2 헤드라인", "body": "팩트+2차팩트, 핵심수치는 **볼드**", "search_query": "데이터/차트 느낌 영어검색어"}},
+    {{"emoji": "😰", "title": "슬라이드3 헤드라인(쟁점)", "body": "모순 대비 + 불안 증폭 마무리", "search_query": "영어검색어"}},
+    {{"emoji": "🙌", "title": "슬라이드4 헤드라인(질문형)", "body": "체크리스트 있다는 예고만, 내용 절대 공개 금지", "search_query": "영어검색어"}},
+    {{"emoji": "💬", "title": "슬라이드5 헤드라인", "body": "팔로우+댓글유도+DM안내 문구", "search_query": "영어검색어"}}
+  ],
+  "caption": "질문 1줄 + 투표/댓글 유도, 짧게"
 }}
-
-- cards는 원문 분량에 따라 2~9장 사이로 알아서 나눠줘 (표지 1장을 더하면 인스타그램 캐러셀 최대 장수인 10장을 넘지 않아야 해)
-- body는 불릿 없이 자연스럽게 이어지는 문단으로, 강조 구절은 딱 하나만 **로 감싸기
-- 중요: thumbnail_line1, thumbnail_line2, title, body 안에는 이모지를 절대 넣지 마. 이모지는 각 카드의 emoji 필드에만 딱 1개씩 넣어줘
-- 원문:
-{raw_text}
+title, body, line1, line2, caption 안에는 이모지 넣지 마 (emoji 필드에만 딱 1개씩).
 """
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 4096,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    text = resp.json()["content"][0]["text"].strip()
-    text = re.sub(r"^```json\s*|\s*```$", "", text.strip())
-    return json.loads(text)
+    return call_claude_json(prompt, max_tokens=2000)
 
 
 def youtube_top_videos(query, max_results=4):
@@ -344,19 +353,32 @@ def ai_generate_package(topic):
 이 주제로 콘텐츠 패키지를 만들어줘. 아래 JSON 형식으로만 답해, 다른 설명 붙이지 마.
 이모지는 각 지정된 필드에만 넣고, 그 외 텍스트(제목/본문/대본)에는 절대 넣지 마.
 
+릴스 대본 2가지:
+- reels_script_a: 30초 분량, 실제 말하는 대사 그대로, 후킹 문장으로 시작해서 본론-마무리 구조로
+- reels_script_b: 30초 분량, 버전A와 다른 각도/톤으로 (예: 하나는 정보전달형, 하나는 스토리텔링형)
+
+카드뉴스는 "5슬라이드 공식"을 반드시 따라서 고정 5장으로 만들어줘 (표지1 + 본문4):
+- cover(슬라이드1/후킹): 숫자 포함 자극적 헤드라인 두 줄, 위기감 도는 배경톤
+- slides[0](슬라이드2/팩트): 핵심 수치 **볼드** 포함한 팩트 제시
+- slides[1](슬라이드3/반전): 모순되는 두 정보 대비 + 불안 증폭 마무리
+- slides[2](슬라이드4/예고): "무엇을 점검해야 할까요?" 톤, 체크리스트 있다는 예고만 하고 내용은 절대 공개 금지
+- slides[3](슬라이드5/CTA): 팔로우+댓글 유도, DM으로 자료 보내준다는 문구
+문장은 짧고 단정적으로, 각 슬라이드는 다음 장이 궁금해지는 여운으로 마무리.
+
 {{
-  "reels_script_a": "30초 분량 릴스 대본 버전A. 실제 말하는 대사 그대로, 후킹 문장으로 시작해서 본론-마무리 구조로",
-  "reels_script_b": "30초 분량 릴스 대본 버전B. 버전A와 다른 각도나 톤으로 (예: 하나는 정보전달형, 하나는 스토리텔링형)",
-  "thumbnail_line1": "카드뉴스 표지 첫 줄 (짧게)",
-  "thumbnail_line2": "카드뉴스 표지 둘째 줄 (강조 문구)",
-  "search_query": "표지 배경 스톡사진 영어 검색어 2~4단어",
-  "cards": [
-    {{"emoji": "이모지 1개", "title": "카드 제목", "body": "문단형 본문 2~3문장, 핵심 구절 하나는 **강조**", "search_query": "이 카드용 영어 사진검색어"}}
-  ]
+  "reels_script_a": "...",
+  "reels_script_b": "...",
+  "cover": {{"line1": "...", "line2": "...", "search_query": "위기감 도는 배경사진 영어검색어 2~4단어"}},
+  "slides": [
+    {{"emoji": "이모지1개", "title": "...", "body": "...", "search_query": "영어검색어"}},
+    {{"emoji": "😰", "title": "...", "body": "...", "search_query": "영어검색어"}},
+    {{"emoji": "🙌", "title": "...", "body": "...", "search_query": "영어검색어"}},
+    {{"emoji": "💬", "title": "...", "body": "...", "search_query": "영어검색어"}}
+  ],
+  "caption": "질문 1줄 + 투표/댓글 유도, 짧게"
 }}
-cards는 2~3개로 (표지까지 합쳐 총 3~4장이 되도록).
 """
-    return call_claude_json(prompt, max_tokens=2000)
+    return call_claude_json(prompt, max_tokens=2500)
 
 
 def search_pexels_photo(query, used_ids=None, lock=None):
@@ -544,13 +566,14 @@ def process_generation(chat_id, text):
     try:
         send_message(chat_id, "카드뉴스 만드는 중이에요, 잠시만 기다려주세요... (중단하려면 '취소'라고 보내주세요)")
 
-        s = ai_structure_content(text)
+        s = ai_generate_5slides(text)
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
 
-        cover_query = s.get("search_query", "business finance")
-        cards = s["cards"][:9]  # 표지 1장 + 본문 최대 9장 = 인스타그램 캐러셀 최대치(10장) 안전장치
+        cover = s["cover"]
+        cover_query = cover.get("search_query", "business finance crisis")
+        slides = s["slides"][:4]  # 5슬라이드 공식: 표지1 + 본문4 = 고정 5장
         manual_photo = PENDING_PHOTOS.pop(chat_id, None)
         used_photo_ids = set()
 
@@ -559,7 +582,7 @@ def process_generation(chat_id, text):
             send_message(chat_id, "생성을 중단했어요.")
             return
 
-        total = 1 + len(cards)
+        total = 1 + len(slides)
 
         def fetch_one(c):
             q = c.get("search_query", cover_query)
@@ -570,14 +593,14 @@ def process_generation(chat_id, text):
 
         # 카드별 사진을 순서대로가 아니라 한꺼번에(동시에) 가져와서 속도를 크게 단축
         with ThreadPoolExecutor(max_workers=6) as pool:
-            photo_results = list(pool.map(fetch_one, cards))
+            photo_results = list(pool.map(fetch_one, slides))
 
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
 
-        images = [make_cover(cover_photo, s["thumbnail_line1"], s["thumbnail_line2"], f"1 / {total}")]
-        for i, (c, photo_bytes) in enumerate(zip(cards, photo_results), 2):
+        images = [make_cover(cover_photo, cover["line1"], cover["line2"], f"1 / {total}")]
+        for i, (c, photo_bytes) in enumerate(zip(slides, photo_results), 2):
             images.append(make_content_card(photo_bytes, c.get("emoji", ""), c["title"], c["body"], f"{i} / {total}"))
 
         if job["cancelled"]:
@@ -585,6 +608,8 @@ def process_generation(chat_id, text):
             return
 
         send_photo_group(chat_id, images)
+        if s.get("caption"):
+            send_message(chat_id, "📋 캡션\n\n" + s["caption"])
     except Exception as e:
         send_message(chat_id, f"카드를 만드는 중 오류가 났어요: {e}")
     finally:
@@ -628,15 +653,16 @@ def process_package(chat_id, topic, kind="both"):
         if kind not in ("cards", "both"):
             return
 
-        cover_query = pkg.get("search_query", "business finance")
-        cards = pkg["cards"][:9]
+        cover = pkg["cover"]
+        cover_query = cover.get("search_query", "business finance crisis")
+        slides = pkg["slides"][:4]  # 5슬라이드 공식: 표지1 + 본문4 = 고정 5장
         used_photo_ids = set()
         cover_photo = search_pexels_photo(cover_query, used_photo_ids, PHOTO_LOCK)
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
 
-        total = 1 + len(cards)
+        total = 1 + len(slides)
 
         def fetch_one(c):
             q = c.get("search_query", cover_query)
@@ -646,17 +672,19 @@ def process_package(chat_id, topic, kind="both"):
                 return search_pexels_photo(cover_query, used_photo_ids, PHOTO_LOCK)
 
         with ThreadPoolExecutor(max_workers=6) as pool:
-            photo_results = list(pool.map(fetch_one, cards))
+            photo_results = list(pool.map(fetch_one, slides))
 
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
 
-        images = [make_cover(cover_photo, pkg["thumbnail_line1"], pkg["thumbnail_line2"], f"1 / {total}")]
-        for i, (c, photo_bytes) in enumerate(zip(cards, photo_results), 2):
+        images = [make_cover(cover_photo, cover["line1"], cover["line2"], f"1 / {total}")]
+        for i, (c, photo_bytes) in enumerate(zip(slides, photo_results), 2):
             images.append(make_content_card(photo_bytes, c.get("emoji", ""), c["title"], c["body"], f"{i} / {total}"))
 
         send_photo_group(chat_id, images)
+        if pkg.get("caption"):
+            send_message(chat_id, "📋 캡션\n\n" + pkg["caption"])
     except Exception as e:
         send_message(chat_id, f"패키지를 만드는 중 오류가 났어요: {e}")
     finally:
