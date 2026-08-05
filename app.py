@@ -163,7 +163,8 @@ def wrap_mixed_tokens(draw, tokens, size, max_width):
     return lines
 
 
-def draw_centered_mixed_line(draw, y, line, size, base_color):
+def draw_centered_mixed_line(draw, y, line, size, base_color, accent_color=None):
+    accent_color = accent_color or base_color
     space_w = draw.textlength(" ", font=font(F_BODY, size))
     widths = []
     total_w = 0
@@ -175,7 +176,7 @@ def draw_centered_mixed_line(draw, y, line, size, base_color):
     x = (W - total_w) / 2
     for (word, bold), w in zip(line, widths):
         fnt = font(F_TITLE, size) if bold else font(F_BODY, size)
-        draw.text((x, y), word, font=fnt, fill=base_color)
+        draw.text((x, y), word, font=fnt, fill=(accent_color if bold else base_color))
         x += w + space_w
     return y
 
@@ -252,8 +253,11 @@ def youtube_top_videos(query, max_results=4):
         "part": "snippet,statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY,
     }, timeout=15)
     r2.raise_for_status()
-    out = [{"title": v["snippet"]["title"], "views": int(v["statistics"].get("viewCount", 0))}
-           for v in r2.json().get("items", [])]
+    out = [{
+        "title": v["snippet"]["title"],
+        "views": int(v["statistics"].get("viewCount", 0)),
+        "url": f"https://www.youtube.com/watch?v={v['id']}",
+    } for v in r2.json().get("items", [])]
     out.sort(key=lambda x: x["views"], reverse=True)
     return out
 
@@ -274,19 +278,24 @@ def google_trends_rising(keyword):
 
 
 def collect_trend_data():
-    """시드 키워드 중 일부를 뽑아 유튜브+구글트렌드 데이터를 텍스트로 모음"""
+    """시드 키워드 중 일부를 뽑아 유튜브+구글트렌드 데이터를 텍스트로 모으고, 참고링크 목록도 같이 반환"""
     import random
+    import urllib.parse
     picks = random.sample(SEED_KEYWORDS, k=min(4, len(SEED_KEYWORDS)))
     lines = []
+    references = []  # [(라벨, url), ...]
     for kw in picks:
         try:
             for v in youtube_top_videos(kw, max_results=4):
                 lines.append(f"[유튜브 인기/{kw}] {v['title']} (조회수 {v['views']:,})")
+                references.append((f"▶ {v['title']} (조회수 {v['views']:,})", v["url"]))
         except Exception:
             pass
         for q in google_trends_rising(kw):
             lines.append(f"[구글트렌드 급상승/{kw}] {q}")
-    return "\n".join(lines)
+            trend_url = "https://trends.google.co.kr/trends/explore?geo=KR&q=" + urllib.parse.quote(q)
+            references.append((f"📈 '{q}' 검색 트렌드", trend_url))
+    return "\n".join(lines), references
 
 
 def call_claude(prompt, max_tokens=1500):
@@ -508,7 +517,7 @@ def make_content_card(photo_bytes, emoji, title, body, page_label):
 
     y += 60
     for line in body_lines:
-        draw_centered_mixed_line(draw, y, line, body_size, WHITE)
+        draw_centered_mixed_line(draw, y, line, body_size, WHITE, BRAND_GREEN)
         y += int(body_size * 1.7)
 
     w = draw.textlength(page_label, font=font(F_MONO, 22))
@@ -621,7 +630,7 @@ def process_recommend(chat_id):
     ACTIVE_JOBS[chat_id] = job
     try:
         send_message(chat_id, "요즘 뜨는 금융/투자 주제를 훑어보는 중이에요, 잠시만요...")
-        raw = collect_trend_data()
+        raw, references = collect_trend_data()
         if job["cancelled"]:
             send_message(chat_id, "생성을 중단했어요.")
             return
@@ -629,6 +638,10 @@ def process_recommend(chat_id):
         PENDING_TOPICS[chat_id] = topics
         buttons = [(f"{i+1}. {t[:55]}{'...' if len(t) > 55 else ''}", f"topic:{i}") for i, t in enumerate(topics)]
         send_buttons(chat_id, "요즘 관심 높은 주제들이에요 (인기도 높은 순). 버튼을 눌러 골라주세요 👇", buttons)
+
+        if references:
+            ref_lines = [f"{label}\n{url}" for label, url in references[:15]]
+            send_message(chat_id, "🔗 참고한 인기 영상·트렌드 링크\n\n" + "\n\n".join(ref_lines))
     except Exception as e:
         send_message(chat_id, f"주제를 찾는 중 오류가 났어요: {e}")
     finally:
