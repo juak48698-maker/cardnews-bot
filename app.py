@@ -194,6 +194,7 @@ def ai_generate_5slides(source_text):
     prompt = f"""너는 인스타그램 금융/재테크 카드뉴스 전문 카피라이터야.
 아래 "5슬라이드 공식"을 정확히 따라서 카드뉴스와 캡션을 작성해줘.
 이 공식은 공포/반전/궁금증 유발 구조로, 인게이지먼트(댓글·팔로우 전환)를 극대화하는 데 최적화되어 있어.
+[JSON 형식 유의사항] 모든 문자열 값은 반드시 한 줄로 써 (실제 줄바꿈 금지). 문자열 안에서 인용이 필요하면 큰따옴표(") 대신 작은따옴표(')나 「」를 사용해.
 
 [참고 자료]
 {source_text}
@@ -254,7 +255,7 @@ def ai_generate_5slides(source_text):
 }}
 title, body, line1, line2, caption 안에는 이모지 넣지 마 (emoji 필드에만 딱 1개씩).
 """
-    return call_claude_json(prompt, max_tokens=2400)
+    return call_claude_json(prompt, max_tokens=3200)
 
 
 def youtube_top_videos(query, max_results=4):
@@ -327,9 +328,9 @@ def collect_trend_data():
 
 
 # ============ 뉴스기사 팩트체크 (선택된 주제 1개에 대해서만 실행) ============
-def fetch_naver_news(query, display=3, max_age_hours=48):
+def fetch_naver_news(query, display=3, max_age_hours=168):
     """네이버 뉴스 검색 API로 실제 국내 기사 목록(제목/요약/링크)을 가져옴 (무료)
-    게시된 지 max_age_hours(기본 48시간)가 지난 기사는 제외함"""
+    게시된 지 max_age_hours(기본 168시간=7일)가 지난 기사는 제외함"""
     import datetime
     from email.utils import parsedate_to_datetime
     api_count = max(display * 3, 10)  # 48시간 필터링으로 많이 걸러질 수 있어 넉넉히 가져옴
@@ -371,13 +372,13 @@ def fetch_naver_news(query, display=3, max_age_hours=48):
 
 def fetch_foreign_news(query):
     """Claude의 web search로 해외 증권/경제 관련 실제 외신 기사를 찾아 한국어로 요약 (검색당 $0.01 + 토큰비용)"""
-    prompt = f""""{query}" 관련 지금으로부터 48시간 이내에 게시된 해외 증권/경제 뉴스(블룸버그, CNBC, 로이터, WSJ 등)를 웹검색으로 찾아서,
+    prompt = f""""{query}" 관련 지금으로부터 7일(168시간) 이내에 게시된 해외 증권/경제 뉴스(블룸버그, CNBC, 로이터, WSJ 등)를 웹검색으로 찾아서,
 실제로 검색 결과에서 확인한 기사 최대 3개를 아래 JSON으로만 답해, 다른 설명은 붙이지 마.
 
 {{"articles": [{{"title": "기사 제목(한국어로 번역)", "summary": "핵심 팩트 2~3문장, 수치는 원문 그대로 유지", "link": "실제 기사 URL"}}]}}
 
 반드시 지켜야 할 것:
-- 게시일이 48시간을 넘었거나, 게시일을 검색 결과에서 확인할 수 없는 기사는 절대 포함하지 마
+- 게시일이 7일(168시간)을 넘었거나, 게시일을 검색 결과에서 확인할 수 없는 기사는 절대 포함하지 마
 - 검색으로 확인되지 않은 내용은 절대 지어내지 마
 - 조건에 맞는 기사가 없으면 {{"articles": []}}로 답해"""
     resp = requests.post(
@@ -405,7 +406,7 @@ def fetch_foreign_news(query):
 
 
 def fact_check_topic(topic_question):
-    """사용자가 고른 주제 1개에 대해서만 실제 뉴스기사로 사실관계를 확인 (게시된 지 48시간 이내인 기사만)
+    """사용자가 고른 주제 1개에 대해서만 실제 뉴스기사로 사실관계를 확인 (게시된 지 7일=168시간 이내인 기사만)
     (국내: 네이버 무료 검색 / 해외: Claude 웹서치 유료소액 검색, 둘 다 시도)"""
     articles = []
     try:
@@ -444,13 +445,53 @@ def call_claude(prompt, max_tokens=1500):
 
 
 def extract_json(text):
-    """앞뒤에 설명이 붙어오거나 코드블록으로 감싸져도 안전하게 JSON 부분만 추출"""
+    """앞뒤에 설명이 붙어오거나 코드블록으로 감싸져도 안전하게 JSON 부분만 추출.
+    1차 파싱이 실패하면(AI가 문자열 안에 줄바꿈을 그대로 넣는 등 흔한 실수), 복구를 한 번 더 시도함."""
     text = re.sub(r"^```json\s*|^```\s*|\s*```$", "", text.strip())
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end < start:
         raise ValueError(f"AI 응답에서 JSON을 찾지 못했어요: {text[:200]!r}")
-    return json.loads(text[start:end + 1])
+    candidate = text[start:end + 1]
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+
+    # 복구 시도: 문자열(따옴표) 안에서만 실제 개행/탭을 \n, \t로 이스케이프 (구조 문자는 건드리지 않음)
+    repaired = []
+    in_string = False
+    escape = False
+    for ch in candidate:
+        if in_string:
+            if escape:
+                repaired.append(ch)
+                escape = False
+            elif ch == "\\":
+                repaired.append(ch)
+                escape = True
+            elif ch == '"':
+                repaired.append(ch)
+                in_string = False
+            elif ch == "\n":
+                repaired.append("\\n")
+            elif ch == "\t":
+                repaired.append("\\t")
+            elif ch == "\r":
+                pass
+            else:
+                repaired.append(ch)
+        else:
+            if ch == '"':
+                repaired.append(ch)
+                in_string = True
+            else:
+                repaired.append(ch)
+    repaired_text = "".join(repaired)
+    repaired_text = re.sub(r",\s*([}\]])", r"\1", repaired_text)  # 트레일링 콤마 제거
+
+    return json.loads(repaired_text)
 
 
 def call_claude_json(prompt, max_tokens=1500, retries=2):
@@ -505,6 +546,7 @@ def ai_generate_package(topic_question, source_text, verified=True):
 
 이 근거자료를 바탕으로 콘텐츠 패키지를 만들어줘. 아래 JSON 형식으로만 답해, 다른 설명 붙이지 마.
 이모지는 각 지정된 필드에만 넣고, 그 외 텍스트(제목/본문/대본)에는 절대 넣지 마.
+[JSON 형식 유의사항] 모든 문자열 값은 반드시 한 줄로 써 (실제 줄바꿈 금지, 필요하면 문장으로 이어써). 문자열 안에서 인용이 필요하면 큰따옴표(") 대신 작은따옴표(')나 「」를 사용해.
 
 릴스 대본 2가지:
 - reels_script_a: 30초 분량, 실제 말하는 대사 그대로, 후킹 문장으로 시작해서 본론-마무리 구조로
@@ -542,7 +584,7 @@ def ai_generate_package(topic_question, source_text, verified=True):
   ]
 }}
 """
-    return call_claude_json(prompt, max_tokens=3000)
+    return call_claude_json(prompt, max_tokens=4500)
 
 
 def search_pexels_photo(query, used_ids=None, lock=None):
